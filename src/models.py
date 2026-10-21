@@ -159,7 +159,7 @@ class BankAccount(AbstractAccount):
         owner: Owner,
         account_id: Optional[str] = None,
         balance: Amount = 0,
-        currency: Union[Currency, str] = Currency.RUB,
+        currency: Union[Currency, str] = Currency.USD,
         status: AccountStatus = AccountStatus.ACTIVE,
         *,
         id_generator: Callable[[], str] = generate_short_id,
@@ -182,9 +182,17 @@ class BankAccount(AbstractAccount):
     def withdraw(self, amount: Amount) -> Decimal:
         self._ensure_operable()
         amount = to_money(amount)
-        if amount > self._balance:
-            raise InsufficientFundsError(self._balance, amount, self._currency.value)
-        self._balance -= amount
+        return self._debit(amount, available=self._balance)
+
+    def _debit(self, total: Decimal, available: Decimal) -> Decimal:
+        """Subtract an already validated total if it fits into the available funds.
+
+        Subclasses decide what "available" means (minimum balance, overdraft,
+        free cash) and reuse this single place that actually moves the money.
+        """
+        if total > available:
+            raise InsufficientFundsError(available, total, self._currency.value)
+        self._balance -= total
         return self._balance
 
     def freeze(self) -> None:

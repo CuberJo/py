@@ -28,12 +28,24 @@ class InvalidOperationError(AccountError):
 
 
 class InsufficientFundsError(AccountError):
-    """The balance is too low for the requested withdrawal."""
+    """The available funds are too low for the requested operation."""
 
-    def __init__(self, balance: Decimal, requested: Decimal, currency: str):
+    def __init__(self, available: Decimal, requested: Decimal, currency: str):
         super().__init__(
-            f"Insufficient funds: balance {balance:.2f} {currency}, "
+            f"Insufficient funds: available {available:.2f} {currency}, "
             f"requested {requested:.2f} {currency}"
         )
-        self.balance = balance
+        self.available = available
+        self.requested = requested
+
+
+class LimitExceededError(AccountError):
+    """The amount is above the per-operation limit of the account."""
+
+    def __init__(self, limit: Decimal, requested: Decimal, currency: str):
+        super().__init__(
+            f"Operation limit exceeded: limit {limit:.2f} {currency}, "
+            f"requested {requested:.2f} {currency}"
+        )
+        self.limit = limit
         self.requested = requested

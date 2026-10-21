@@ -19,7 +19,7 @@ from utils import format_money, mask_account_id, to_money  # noqa: E402
 
 @pytest.fixture
 def owner() -> Owner:
-    return Owner("Ivan Petrov", "ivan@example.com")
+    return Owner("John Smith", "john@example.com")
 
 
 @pytest.fixture
@@ -92,7 +92,7 @@ def test_rejects_unknown_status(owner):
 
 def test_rejects_non_owner(owner):
     with pytest.raises(InvalidOperationError):
-        BankAccount("Ivan Petrov")
+        BankAccount("John Smith")
 
 
 @pytest.mark.parametrize("name", ["", "   "])
@@ -103,7 +103,7 @@ def test_owner_requires_name(name):
 
 def test_owner_rejects_bad_email():
     with pytest.raises(InvalidOperationError):
-        Owner("Ivan", "not-an-email")
+        Owner("John", "not-an-email")
 
 
 # --- Money operations ---
@@ -195,22 +195,22 @@ def test_closed_status_is_terminal(owner):
 def test_str_contains_required_parts(account):
     text = str(account)
     assert "Bank account" in text
-    assert "Ivan Petrov" in text
+    assert "John Smith" in text
     assert "****0001" in text
     assert "ACC-0001" not in text
     assert "active" in text
-    assert "1 000.00 RUB" in text
+    assert "1 000.00 USD" in text
 
 
 def test_get_account_info(account):
     assert account.get_account_info() == {
         "type": "Bank account",
         "account_id": "ACC-0001",
-        "owner": "Ivan Petrov",
-        "email": "ivan@example.com",
+        "owner": "John Smith",
+        "email": "john@example.com",
         "status": "active",
         "balance": Decimal("1000.00"),
-        "currency": "RUB",
+        "currency": "USD",
     }
 
 
@@ -223,5 +223,5 @@ def test_to_money_quantizes_to_cents():
 
 
 def test_mask_and_format_helpers():
-    assert mask_account_id("40817810099910004312") == "****4312"
+    assert mask_account_id("987654324312") == "****4312"
     assert format_money(Decimal("1234567.5")) == "1 234 567.50"
