@@ -10,6 +10,7 @@ from clients import Client
 from exceptions import (
     AccountNotFoundError,
     AuthenticationError,
+    BankError,
     ClientBlockedError,
     ClientNotFoundError,
     InvalidOperationError,
@@ -74,6 +75,10 @@ class Bank:
     @property
     def clients(self) -> tuple[Client, ...]:
         return tuple(self._clients.values())
+
+    def now(self) -> datetime:
+        """The current time by the bank's clock."""
+        return self._clock()
 
     # --- Clients ---
 
@@ -172,6 +177,30 @@ class Bank:
         account = self._get_operable_account(account_id, "withdraw")
         self._flag_if_large("withdrawal", account, amount)
         return account.withdraw(amount)
+
+    def transfer(self, sender_id: str, receiver_id: str, debit: Amount, credit: Amount) -> Decimal:
+        """Take ``debit`` from the sender and add ``credit`` to the receiver as one operation.
+
+        The amounts differ when the currencies differ or a fee is charged. The
+        sender's own withdrawal rules apply (a premium account also pays its fee).
+        If the receiver rejects the money, the sender gets it back.
+        Returns the sender's new balance.
+        """
+        if sender_id == receiver_id:
+            raise InvalidOperationError("Cannot transfer to the same account")
+        sender = self._get_operable_account(sender_id, "transfer")
+        receiver = self._get_operable_account(receiver_id, "receive a transfer")
+        credit = to_money(credit)
+        self._flag_if_large("transfer", sender, debit)
+        before = sender.balance
+        balance = sender.withdraw(debit)
+        try:
+            receiver.deposit(credit)
+        except BankError:
+            # Undo the whole debit, including any fee the sender's account added
+            sender.deposit(before - balance)
+            raise
+        return balance
 
     def search_accounts(
         self,

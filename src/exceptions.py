@@ -102,3 +102,11 @@ class ClientBlockedError(BankError):
 
 class OperationTimeError(BankError):
     """The operation is not allowed at this time of day."""
+
+
+class TransactionNotFoundError(BankError):
+    """No transaction with this ID is in the queue."""
+
+    def __init__(self, transaction_id: str):
+        super().__init__(f"Transaction {transaction_id} not found")
+        self.transaction_id = transaction_id

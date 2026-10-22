@@ -1,4 +1,4 @@
-"""Demo of all account types and the bank: accounts, clients, logins and security rules."""
+"""Demo of all account types, the bank and transactions: clients, logins, rules and the queue."""
 
 from datetime import date, datetime
 from typing import Any, Callable
@@ -8,9 +8,12 @@ from bank import Bank
 from clients import Client
 from exceptions import BankError
 from models import AccountStatus, BankAccount, Owner
+from transactions import ExchangeRates, Transaction, TransactionProcessor, TransactionQueue
 
 # Illustrative yearly rates for the training model, not real market data
 DEMO_GROWTH_RATES = {"stocks": 0.10, "bonds": 0.04, "etf": 0.07}
+# Illustrative exchange rates: the value of one unit in USD
+DEMO_EXCHANGE_RATES = {"EUR": "1.08", "RUB": "0.011", "KZT": "0.002", "CNY": "0.14"}
 
 
 def attempt(description: str, operation: Callable[[], Any]) -> None:
@@ -275,11 +278,112 @@ def demo_bank() -> None:
     print(f"  {bank}")
 
 
+def demo_transactions() -> None:
+    print("\n=== Transactions: ten transactions in the queue ===")
+    clock = DemoClock(datetime(2026, 10, 22, 14, 0))
+    bank = Bank("Training Bank", clock=clock)
+    john = bank.add_client(Client("John Smith", date(1985, 3, 12), "1234", client_id="CL-001"))
+    mary = bank.add_client(Client("Mary Williams", date(1992, 7, 30), "5678", client_id="CL-002"))
+    bank.open_account(john.client_id, account_id="JOHN-1001", balance=5_000)
+    bank.open_account(john.client_id, account_id="JOHN-1002", balance=1_000, currency="EUR")
+    bank.open_account(
+        john.client_id, SavingsAccount, account_id="JOHN-1003", balance=2_000, min_balance=500
+    )
+    bank.open_account(mary.client_id, PremiumAccount, account_id="MARY-2001", balance=1_000, fee=0)
+    bank.open_account(mary.client_id, account_id="MARY-2002", balance=100)
+    bank.freeze_account("JOHN-1003")
+
+    queue = TransactionQueue(clock=clock)
+    processor = TransactionProcessor(bank, rates=ExchangeRates(DEMO_EXCHANGE_RATES))
+    night = datetime(2026, 10, 23, 4, 30)
+
+    def queue_tx(description: str, *args: Any, **kwargs: Any) -> None:
+        tx_id = f"TX-{len(queue) + 1:02}"
+        queue.add(Transaction(*args, transaction_id=tx_id, created_at=clock.now, **kwargs))
+        print(f"  Queued {tx_id}: {description}")
+
+    queue_tx("Deposit 1 000 USD to John", "deposit", 1_000, receiver_id="JOHN-1001")
+    queue_tx(
+        "John: transfer 500 USD to Mary",
+        "transfer",
+        500,
+        sender_id="JOHN-1001",
+        receiver_id="MARY-2002",
+    )
+    queue_tx(
+        "John: transfer 200 EUR to his USD account",
+        "transfer",
+        200,
+        "EUR",
+        sender_id="JOHN-1002",
+        receiver_id="JOHN-1001",
+    )
+    queue_tx(
+        "John: external transfer 1 000 USD (1% fee)",
+        "external_transfer",
+        1_000,
+        sender_id="JOHN-1001",
+        receiver_id="DE89370400440532",
+    )
+    queue_tx(
+        "Mary, premium: transfer 3 000 USD into the minus",
+        "transfer",
+        3_000,
+        sender_id="MARY-2001",
+        receiver_id="JOHN-1001",
+    )
+    queue_tx(
+        "Mary, regular: transfer 5 000 USD into the minus",
+        "transfer",
+        5_000,
+        sender_id="MARY-2002",
+        receiver_id="JOHN-1001",
+    )
+    queue_tx("Deposit 50 USD to a frozen account", "deposit", 50, receiver_id="JOHN-1003")
+    queue_tx(
+        "John: urgent withdrawal (priority 10)",
+        "withdrawal",
+        100,
+        sender_id="JOHN-1001",
+        priority=10,
+    )
+    queue_tx(
+        "Deferred deposit to Mary at 04:30 tomorrow",
+        "deposit",
+        300,
+        receiver_id="MARY-2002",
+        scheduled_at=night,
+    )
+    queue_tx("Deposit to be cancelled", "deposit", 999, receiver_id="JOHN-1001")
+
+    print("\n=== Transactions: cancel and run the queue ===")
+    attempt("Cancel TX-10", lambda: queue.cancel("TX-10", "Cancelled by the client"))
+    attempt("Cancel TX-99", lambda: queue.cancel("TX-99"))
+    for when in (clock.now, night, datetime(2026, 10, 23, 5, 0)):
+        clock.now = when
+        processed = processor.run(queue)
+        print(f"  Run at {when:%Y-%m-%d %H:%M}: processed {len(processed)}, left {len(queue)}")
+        for tx in processed:
+            print(f"    {tx}")
+
+    print("\n=== Transactions: results ===")
+    for account in bank.search_accounts():
+        print(f"  {account}")
+    print("  Error log:")
+    for error in processor.error_log:
+        retry = "retry" if error.will_retry else "final"
+        print(
+            f"    {error.timestamp:%H:%M} | {error.transaction_id} | attempt {error.attempt} | "
+            f"{retry} | {error.error}: {error.message}"
+        )
+
+
 def main() -> None:
     demo_bank_account()
     accounts: list[BankAccount] = [*demo_savings(), *demo_premium(), *demo_investment()]
     demo_polymorphism(accounts)
     demo_bank()
+    demo_transactions()
 
 
 if __name__ == "__main__":

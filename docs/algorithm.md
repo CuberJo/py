@@ -15,7 +15,8 @@ BankError (Exception)
 ├── AccountNotFoundError
 ├── AuthenticationError
 ├── ClientBlockedError
-└── OperationTimeError
+├── OperationTimeError
+└── TransactionNotFoundError
 
 AbstractAccount (ABC)                 Owner (frozen dataclass)
 │  _account_id, _owner,               AccountStatus (Enum): ACTIVE, FROZEN, CLOSED
@@ -45,6 +46,27 @@ Client (clients.py)                       Bank (bank.py)
 
 The bank holds clients and accounts; accounts do not know about the bank, so the
 account classes did not change for Day 3.
+
+```
+Transaction (transactions.py)             TransactionQueue
+   _transaction_id, _type, _amount,          _entries: transaction_id → (sequence, Transaction)
+   _currency, _fee, _sender_id,              add(), cancel(), pending(), ready(), pop_next()
+   _receiver_id, _status, _failure_reason,
+   _priority, _attempts,                  TransactionProcessor
+   _debited_amount, _credited_amount,        _bank, _rates: ExchangeRates
+   _created_at, _scheduled_at,               _external_fee_rate, _max_attempts, _retry_delay
+   _processed_at                             _errors: [ProcessingError]
+   is_due(), cancel()                        calculate_fee(), process(), run(queue)
+
+TransactionType (Enum): DEPOSIT, WITHDRAWAL, TRANSFER, EXTERNAL_TRANSFER
+TransactionStatus (Enum): PENDING, COMPLETED, FAILED, CANCELLED
+ExchangeRates: currency → value of one unit in the base currency
+```
+
+The processor moves money only through the bank (`deposit`, `withdraw`, `transfer`), so
+the night rule, blocked clients, the large-operation flag and every account type's own
+rules still apply. The only Day 4 changes to existing classes are `Bank.transfer()` and
+`Bank.now()`.
 
 ## Amount validation (`utils.to_money`)
 
@@ -191,8 +213,90 @@ _get_operable_account(account_id, action):
 | `freeze_account` | no | no | `account.freeze()` — protective, always allowed |
 | `unfreeze_account` | yes | yes | `account.unfreeze()` |
 | `deposit` / `withdraw` | yes | yes | flag if amount ≥ 1 000 000, then the account's own method |
+| `transfer(sender, receiver, debit, credit)` | yes | both owners | flag if debit ≥ 1 000 000, withdraw from the sender, deposit to the receiver |
 
 Account rules (frozen, closed, limits, minimum balance) are still checked by the account itself.
+
+`transfer` is atomic: it remembers the sender's balance, calls `sender.withdraw(debit)` and
+then `receiver.deposit(credit)`. If the deposit fails, it deposits `before − after` back to the
+sender, which also returns a fee the sender's account added (premium), and re-raises the error.
+
+## Transactions
+
+### Transaction
+
+A transaction is created as `PENDING` and is checked at once: the amount goes through
+`to_money`, the currency through `Currency.parse`, and the accounts must match the type:
+
+| Type | Sender | Receiver | Bank call |
+|---|---|---|---|
+| `deposit` | — | account of the bank | `deposit` |
+| `withdrawal` | account of the bank | — | `withdraw` |
+| `transfer` | account of the bank | another account of the bank | `transfer` |
+| `external_transfer` | account of the bank | account in another bank (any string) | `withdraw` |
+
+```
+PENDING ──► COMPLETED   (processor: fee, debited and credited amounts, processed_at)
+   │  ├───► FAILED      (processor: failure_reason = "ErrorName: message")
+   │  └───► CANCELLED   (cancel(): reason)
+   └── retry: stays PENDING, scheduled_at moves forward, attempts += 1
+```
+
+Final statuses cannot change: a second `cancel()` or processing a finished transaction raises
+`InvalidOperationError`. `fee` is zero until the transaction completes, since a failed one
+charges nothing.
+
+### Queue
+
+The queue keeps `transaction_id → (sequence, transaction)`; the sequence is a counter that
+grows with every `add`. Processing order is the sort key `(−priority, sequence)`: higher
+priority first, equal priority in the order added. A transaction is due when
+`scheduled_at` is empty or not later than now, so a deferred one stays in the queue until
+then. `pop_next(now)` removes and returns the first due transaction; `cancel(id)` removes
+it and marks it `CANCELLED`. The queue sorts on every call, which is enough for a training
+model; a heap would be the choice for many transactions.
+
+### Processor
+
+```
+process(transaction):                    # one attempt
+    attempts += 1; now = bank.now()
+    fee = amount × external_fee_rate if external_transfer else 0     # rounded to cents
+    try:
+        look up the sender and receiver   # external receiver must not be in this bank
+        both not FROZEN / CLOSED          # else AccountFrozenError / AccountClosedError
+        debit  = convert(amount + fee, tx currency → sender currency)
+        credit = convert(amount,       tx currency → receiver currency)
+        sender not premium and debit > balance → InsufficientFundsError
+        bank.deposit / withdraw / transfer
+    except BankError as error:
+        log ProcessingError(now, id, attempt, error, will_retry)
+        will_retry = OperationTimeError and attempts < max_attempts
+        will_retry → scheduled_at = now + retry_delay       # stays PENDING
+        otherwise  → FAILED with the reason
+    else: COMPLETED
+
+run(queue):
+    now = bank.now()
+    while (tx := queue.pop_next(now)):
+        process(tx); if still PENDING: queue.add(tx)        # back with the new time
+```
+
+Notes:
+
+- All rules are checked before the bank call, so a rejected transaction moves no money.
+- The negative-balance rule repeats what most account types already refuse, so it holds for
+  any account type that might be added later. A premium account may go below zero within
+  its overdraft, and may keep sending money while it is already in the minus.
+- An external transfer pays `amount + fee`; the other bank gets `amount`. A premium sender
+  also pays its own per-withdrawal `fee`, since the account's `withdraw` rules apply.
+- Conversion: `ExchangeRates` stores what one unit of each currency is worth in the base
+  currency (`USD` = 1). `convert(a, X, Y) = round_money(a × rate[X] / rate[Y])`. Same
+  currency needs no rates; a missing rate fails the transaction with `InvalidOperationError`.
+- Only the night rule is retried, since waiting fixes it; other errors (frozen account,
+  no money, unknown account) will not change by themselves. A retry gets a new sequence
+  number, so it goes after transactions of the same priority that were already queued.
+- Time comes from `bank.now()`, so the processor follows the same clock as the night rule.
 
 ## Authentication
 
@@ -241,6 +345,8 @@ optionally for one client. The time comes from the bank's `clock`.
   exceptions in `exceptions.py`; the account classes only hold state and apply rules.
   Day 2 account types live in their own module, `accounts.py`; clients live in `clients.py`,
   and `bank.py` only coordinates clients and accounts and applies the security rules.
+  In `transactions.py`, `Transaction` holds data and its status, `TransactionQueue` only orders
+  and stores, and `TransactionProcessor` applies the transaction rules.
 - **Open/closed.** The Day 2 account types were added by subclassing `BankAccount`;
   the only change to existing code was extracting `_debit` from `withdraw` so the
   subclasses can reuse it. Status rules are data (`_ALLOWED_TRANSITIONS`,
@@ -260,4 +366,5 @@ optionally for one client. The time comes from the bank's `clock`.
   other callers can provide their own. `project_yearly_growth` gets the growth rates
   as an argument instead of looking them up, so the account does not depend on any
   source of market data. `Bank` gets its `clock` the same way, so the night rule does not
-  depend on the real time.
+  depend on the real time. `TransactionProcessor` gets the bank and the `ExchangeRates`
+  as parameters, and its fee rate, retry count and delay are settings.

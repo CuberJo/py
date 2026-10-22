@@ -6,8 +6,11 @@ single-currency account with input validation, status checks and auto-generated 
 `SavingsAccount`, `PremiumAccount` and `InvestmentAccount` extend `BankAccount`
 with their own withdrawal rules and extra features.
 `Bank` manages `Client`s and their accounts, with PIN logins and security rules.
+`Transaction`, `TransactionQueue` and `TransactionProcessor` run money operations
+through a priority queue, with fees, currency conversion and retries.
 
 All data lives in memory: there is no database, no external API and no real market data.
+Exchange rates are fixed values passed in by the caller.
 
 ## Features
 
@@ -43,7 +46,8 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
   `freeze_account()`, `unfreeze_account()`, `deposit()`, `withdraw()`, `authenticate_client()`,
   `unblock_client()`, `search_accounts()` (by client, owner name, status, currency, type, balance)
 - Reports: `get_total_balance(currency)` and `get_clients_ranking(currency)`; invested money counts,
-  closed accounts do not, and currencies are never mixed because the model has no exchange rates
+  closed accounts do not, and currencies are never mixed (exchange rates are used only by
+  the transaction processor)
 - Security:
   - 3 wrong PINs in a row block the client; a blocked client cannot log in or operate until
     `unblock_client()`; a successful login resets the counter
@@ -51,6 +55,28 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
     since it protects the client, and logging in is allowed
   - suspicious activity log (`get_suspicious_activities()`): blocking after failed logins, logins
     while blocked or with an unknown ID, night attempts, deposits and withdrawals of 1 000 000 or more
+
+### Transactions (Day 4)
+
+- `Transaction`: ID, type (`deposit`, `withdrawal`, `transfer`, `external_transfer`), amount,
+  currency, fee, sender and receiver accounts, status (`pending`, `completed`, `failed`,
+  `cancelled`), failure reason, priority, attempts, the debited and credited amounts, and
+  timestamps (`created_at`, `scheduled_at`, `processed_at`)
+- `TransactionQueue`: `add()`, `cancel()`, `pending()`, `ready()`, `pop_next()`. Higher priority
+  goes first, then the order added. A transaction with `scheduled_at` waits until that time
+- `TransactionProcessor`: `process()` makes one attempt, `run(queue)` processes everything that
+  is due now
+  - fees: an external transfer costs 1% of the amount (`external_fee_rate`); internal operations are free
+  - conversion: `ExchangeRates` converts the amount to the sender's and the receiver's currency
+  - retries: a night-time rejection (`OperationTimeError`) is retried every 30 minutes, at most 3
+    attempts in total; any other error fails the transaction at once
+  - error log: `error_log` keeps every failed attempt (time, transaction, attempt, error, retry or final)
+- Rules, checked before any money moves:
+  - only a `PremiumAccount` may go below zero (within its overdraft)
+  - a frozen or closed account can neither send nor receive money
+  - an external transfer pays the fee on top of the amount
+- `Bank.transfer()` moves money between two accounts as one operation: if the receiver
+  rejects it, the sender gets the money back
 
 ## Project structure
 
@@ -63,12 +89,14 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── accounts.py    # SavingsAccount, PremiumAccount, InvestmentAccount, AssetType
 │   ├── clients.py     # Client, ClientStatus
 │   ├── bank.py        # Bank, SuspiciousActivity, ClientRank
+│   ├── transactions.py  # Transaction, TransactionQueue, TransactionProcessor, ExchangeRates
 │   ├── utils.py       # money and rate validation, ID generation, formatting
 │   └── exceptions.py  # custom exceptions
 ├── tests/
 │   ├── test_main.py       # BankAccount, utils
 │   ├── test_accounts.py   # savings, premium and investment accounts
-│   └── test_bank.py       # clients, bank operations, logins, security rules, reports
+│   ├── test_bank.py       # clients, bank operations, logins, security rules, reports
+│   └── test_transactions.py  # transactions, queue, processor rules, ten transactions end to end
 └── docs/
     └── algorithm.md   # algorithms and design
 ```
@@ -140,11 +168,35 @@ bank.get_clients_ranking("USD")    # [ClientRank(position=1, client=..., total=D
 `Bank` takes an optional `clock` (a function returning `datetime`), so the night rule
 can be tested at any real time.
 
+### Transactions
+
+```python
+from transactions import ExchangeRates, Transaction, TransactionProcessor, TransactionQueue
+
+usd = bank.open_account(john.client_id, account_id="JOHN-1001", balance=5_000)
+eur = bank.open_account(john.client_id, account_id="JOHN-1002", currency="EUR")
+
+queue = TransactionQueue()
+processor = TransactionProcessor(bank, rates=ExchangeRates({"EUR": "1.08"}))   # 1 EUR = 1.08 USD
+queue.add(Transaction("transfer", 1_080, sender_id="JOHN-1001", receiver_id="JOHN-1002"))
+queue.add(Transaction("external_transfer", 1_000, sender_id="JOHN-1001",
+                      receiver_id="DE89370400440532", priority=5))
+processor.run(queue)     # the external transfer goes first because of its priority
+usd.balance              # Decimal('2910.00'): 5 000 − (1 000 + 1% fee) − 1 080
+eur.balance              # Decimal('1000.00')
+```
+
 The demo (`python src/main.py`) creates two accounts of each type, runs valid and invalid
 operations on them, and then calls `withdraw()`, `__str__()` and `get_account_info()`
 on all of them through one loop. The growth rates in the demo (stocks 10%, bonds 4%,
 etf 7%) are made-up values for the exercise. The bank part of the demo adds clients,
 opens accounts, shows successful and failed logins with blocking, freezing, a night-time
 attempt on a settable clock, search, reports and the suspicious activity log.
+The transactions part queues ten transactions (a deposit, transfers with and without
+conversion, an external transfer with a fee, a premium account going into the minus,
+rejected transfers from a regular account and to a frozen one, an urgent withdrawal,
+a deferred deposit and a cancelled one), then runs the queue in the afternoon, at 04:30
+(the deferred deposit is rejected for the night and retried) and at 05:00, and prints
+the balances and the error log. Its exchange rates are made-up values too.
 
 See [docs/algorithm.md](docs/algorithm.md) for how validation, statuses and the class design work.
