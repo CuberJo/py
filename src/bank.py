@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Callable, Optional, Union
 
 from accounts import InvestmentAccount
+from audit import AuditLevel, AuditLog
 from clients import Client
 from exceptions import (
     AccountNotFoundError,
@@ -47,7 +48,8 @@ class Bank:
     - account operations are not allowed from ``NIGHT_START`` to ``NIGHT_END``,
       except freezing, which protects the client and is always allowed;
     - failed logins for unknown IDs, blocking, night attempts and large
-      operations are recorded as suspicious activity.
+      operations are recorded as suspicious activity, and also go to the
+      audit log as warnings if one is given.
     """
 
     MAX_LOGIN_ATTEMPTS = 3
@@ -56,10 +58,18 @@ class Bank:
     # Deposits and withdrawals of at least this amount are flagged (in account currency)
     LARGE_OPERATION_THRESHOLD = Decimal("1000000.00")
 
-    def __init__(self, name: str, *, clock: Callable[[], datetime] = datetime.now):
+    def __init__(
+        self,
+        name: str,
+        *,
+        clock: Callable[[], datetime] = datetime.now,
+        audit_log: Optional[AuditLog] = None,
+    ):
         # The clock is injected so tests and the demo can control the time of day
         if not isinstance(name, str) or not name.strip():
             raise InvalidOperationError("Bank name cannot be empty")
+        if audit_log is not None and not isinstance(audit_log, AuditLog):
+            raise InvalidOperationError("audit_log must be an AuditLog instance")
         self._name = name.strip()
         self._clock = clock
         self._clients: dict[str, Client] = {}
@@ -67,10 +77,15 @@ class Bank:
         self._account_owners: dict[str, str] = {}  # account_id -> client_id
         self._failed_logins: dict[str, int] = {}
         self._suspicious: list[SuspiciousActivity] = []
+        self._audit_log = audit_log
 
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def audit_log(self) -> Optional[AuditLog]:
+        return self._audit_log
 
     @property
     def clients(self) -> tuple[Client, ...]:
@@ -157,6 +172,11 @@ class Bank:
         if account is None:
             raise AccountNotFoundError(account_id)
         return account
+
+    def get_account_owner_id(self, account_id: str) -> str:
+        """The ID of the client who owns the account."""
+        self.get_account(account_id)
+        return self._account_owners[account_id]
 
     def close_account(self, account_id: str) -> None:
         self._get_operable_account(account_id, "close the account").close()
@@ -301,7 +321,17 @@ class Bank:
     def _flag(
         self, reason: str, *, client_id: Optional[str] = None, account_id: Optional[str] = None
     ) -> None:
-        self._suspicious.append(SuspiciousActivity(self._clock(), reason, client_id, account_id))
+        activity = SuspiciousActivity(self._clock(), reason, client_id, account_id)
+        self._suspicious.append(activity)
+        if self._audit_log is not None:
+            self._audit_log.log(
+                AuditLevel.WARNING,
+                "suspicious_activity",
+                reason,
+                timestamp=activity.timestamp,
+                client_id=client_id,
+                account_id=account_id,
+            )
 
     def _flag_if_large(self, operation: str, account: BankAccount, amount: Amount) -> None:
         amount = to_money(amount)

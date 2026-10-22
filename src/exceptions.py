@@ -110,3 +110,16 @@ class TransactionNotFoundError(BankError):
     def __init__(self, transaction_id: str):
         super().__init__(f"Transaction {transaction_id} not found")
         self.transaction_id = transaction_id
+
+
+class SuspiciousOperationError(BankError):
+    """The operation is blocked because its risk level is too high."""
+
+    def __init__(self, transaction_id: str, level: str, reasons: list[str]):
+        message = f"Transaction {transaction_id} blocked, {level} risk"
+        if reasons:
+            message += ": " + ", ".join(reasons)
+        super().__init__(message)
+        self.transaction_id = transaction_id
+        self.level = level
+        self.reasons = reasons

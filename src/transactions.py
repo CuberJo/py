@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Union
 
 from accounts import PremiumAccount
+from audit import AuditLevel, AuditLog
 from bank import Bank
 from exceptions import (
     AccountClosedError,
@@ -17,6 +18,7 @@ from exceptions import (
     InsufficientFundsError,
     InvalidOperationError,
     OperationTimeError,
+    SuspiciousOperationError,
     TransactionNotFoundError,
 )
 from models import AccountStatus, BankAccount, Currency
@@ -30,6 +32,9 @@ from utils import (
     to_money,
     to_rate,
 )
+
+if TYPE_CHECKING:
+    from risk import RiskAnalyzer, RiskAssessment
 
 
 class TransactionType(Enum):
@@ -394,6 +399,15 @@ class ExchangeRates:
         return round_money(amount * self._rates[source] / self._rates[target])
 
 
+def find_client_id(bank: Bank, transaction: Transaction) -> Optional[str]:
+    """The client a transaction belongs to: the sender's owner, or the receiver's for a deposit.
+
+    Raises ``AccountNotFoundError`` if that account is not in the bank.
+    """
+    account_id = transaction.sender_id or transaction.receiver_id
+    return bank.get_account_owner_id(account_id) if account_id is not None else None
+
+
 @dataclass(frozen=True)
 class ProcessingError:
     """One failed attempt to process a transaction."""
@@ -417,6 +431,10 @@ class TransactionProcessor:
     An error from ``RETRYABLE_ERRORS`` (a night-time rejection) is retried after
     ``retry_delay``, up to ``max_attempts`` attempts in total; any other error
     fails the transaction at once. Every failed attempt goes to the error log.
+
+    With a ``risk_analyzer`` every attempt is scored first, and a transaction
+    the analyzer marks as blocked fails with ``SuspiciousOperationError``
+    without moving money. With an ``audit_log`` every outcome is recorded there.
     """
 
     RETRYABLE_ERRORS: tuple[type[BankError], ...] = (OperationTimeError,)
@@ -432,7 +450,12 @@ class TransactionProcessor:
         external_fee_rate: Rate = DEFAULT_EXTERNAL_FEE_RATE,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         retry_delay: timedelta = DEFAULT_RETRY_DELAY,
+        audit_log: Optional[AuditLog] = None,
+        risk_analyzer: Optional["RiskAnalyzer"] = None,
     ):
+        # Imported here: risk.py imports this module, so a top-level import would be circular
+        from risk import RiskAnalyzer
+
         if not isinstance(bank, Bank):
             raise InvalidOperationError("bank must be a Bank instance")
         if rates is not None and not isinstance(rates, ExchangeRates):
@@ -441,12 +464,18 @@ class TransactionProcessor:
             raise InvalidOperationError(f"max_attempts must be at least 1, got: {max_attempts!r}")
         if not isinstance(retry_delay, timedelta) or retry_delay <= timedelta(0):
             raise InvalidOperationError(f"retry_delay must be positive, got: {retry_delay!r}")
+        if audit_log is not None and not isinstance(audit_log, AuditLog):
+            raise InvalidOperationError("audit_log must be an AuditLog instance")
+        if risk_analyzer is not None and not isinstance(risk_analyzer, RiskAnalyzer):
+            raise InvalidOperationError("risk_analyzer must be a RiskAnalyzer instance")
         self._bank = bank
         self._rates = rates
         self._external_fee_rate = to_rate(external_fee_rate, maximum=Decimal(1))
         self._max_attempts = max_attempts
         self._retry_delay = retry_delay
         self._errors: list[ProcessingError] = []
+        self._audit_log = audit_log
+        self._risk_analyzer = risk_analyzer
 
     @property
     def error_log(self) -> list[ProcessingError]:
@@ -470,6 +499,7 @@ class TransactionProcessor:
         now = self._bank.now()
         fee = self.calculate_fee(transaction)
         try:
+            self._check_risk(transaction, now)
             debited, credited = self._execute(transaction, fee)
         except BankError as error:
             will_retry = (
@@ -490,8 +520,19 @@ class TransactionProcessor:
                 transaction._reschedule(now + self._retry_delay)
             else:
                 transaction._fail(now, f"{type(error).__name__}: {error}")
+            self._audit_failure(transaction, error, will_retry, now)
         else:
             transaction._complete(now, fee, debited, credited)
+            self._audit(
+                AuditLevel.INFO,
+                "transaction_completed",
+                str(transaction),
+                transaction,
+                now,
+                amount=transaction.amount,
+                currency=transaction.currency.value,
+                fee=fee,
+            )
         return transaction
 
     def run(self, queue: TransactionQueue) -> list[Transaction]:
@@ -508,6 +549,79 @@ class TransactionProcessor:
                 queue.add(transaction)
             attempted.append(transaction)
         return attempted
+
+    def _check_risk(self, transaction: Transaction, now: datetime) -> None:
+        """Score the attempt; raise ``SuspiciousOperationError`` if it must be blocked."""
+        if self._risk_analyzer is None:
+            return
+        assessment = self._risk_analyzer.check(transaction, now)
+        if assessment.blocked:
+            raise SuspiciousOperationError(
+                transaction.transaction_id, assessment.level.value, assessment.reasons
+            )
+        if assessment.factors:
+            # Low risk with a factor is noted; medium risk is a warning
+            self._audit(
+                AuditLevel.INFO if assessment.level.value == "low" else AuditLevel.WARNING,
+                "risk_flagged",
+                f"{assessment.level.value} risk, allowed: {', '.join(assessment.reasons)}",
+                transaction,
+                now,
+                assessment=assessment,
+            )
+
+    def _audit_failure(
+        self, transaction: Transaction, error: BankError, will_retry: bool, now: datetime
+    ) -> None:
+        if isinstance(error, SuspiciousOperationError):
+            level, event = AuditLevel.CRITICAL, "transaction_blocked"
+        elif will_retry:
+            level, event = AuditLevel.WARNING, "transaction_retry"
+        else:
+            level, event = AuditLevel.ERROR, "transaction_failed"
+        self._audit(
+            level,
+            event,
+            f"{type(error).__name__}: {error}",
+            transaction,
+            now,
+            error=type(error).__name__,
+            attempt=transaction.attempts,
+        )
+
+    def _audit(
+        self,
+        level: AuditLevel,
+        event: str,
+        message: str,
+        transaction: Transaction,
+        now: datetime,
+        *,
+        assessment: Optional["RiskAssessment"] = None,
+        **details: Any,
+    ) -> None:
+        if self._audit_log is None:
+            return
+        try:
+            client_id = find_client_id(self._bank, transaction)
+        except AccountNotFoundError:
+            client_id = None
+        if assessment is not None:
+            details.update(
+                risk_level=assessment.level.value,
+                risk_score=assessment.score,
+                risk_factors=assessment.reasons,
+            )
+        self._audit_log.log(
+            level,
+            event,
+            message,
+            timestamp=now,
+            client_id=client_id,
+            account_id=transaction.sender_id or transaction.receiver_id,
+            transaction_id=transaction.transaction_id,
+            details=details,
+        )
 
     def _execute(
         self, transaction: Transaction, fee: Decimal

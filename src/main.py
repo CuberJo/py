@@ -1,13 +1,18 @@
-"""Demo of all account types, the bank and transactions: clients, logins, rules and the queue."""
+"""Demo of all account types, the bank, transactions, and the audit and risk analysis."""
 
+import tempfile
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from accounts import InvestmentAccount, PremiumAccount, SavingsAccount
+from audit import AuditLog
 from bank import Bank
 from clients import Client
 from exceptions import BankError
 from models import AccountStatus, BankAccount, Owner
+from reports import AuditReport
+from risk import RiskAnalyzer
 from transactions import ExchangeRates, Transaction, TransactionProcessor, TransactionQueue
 
 # Illustrative yearly rates for the training model, not real market data
@@ -378,12 +383,112 @@ def demo_transactions() -> None:
         )
 
 
+def demo_audit(log_path: Path) -> None:
+    print("\n=== Audit: ordinary and suspicious transactions ===")
+    clock = DemoClock(datetime(2026, 10, 22, 14, 0))
+    audit_log = AuditLog(log_path, clock=clock)
+    bank = Bank("Training Bank", clock=clock, audit_log=audit_log)
+    john = bank.add_client(Client("John Smith", date(1985, 3, 12), "1234", client_id="CL-001"))
+    mary = bank.add_client(Client("Mary Williams", date(1992, 7, 30), "5678", client_id="CL-002"))
+    bank.open_account(john.client_id, account_id="JOHN-1001", balance=500_000)
+    bank.open_account(mary.client_id, account_id="MARY-2001", balance=5_000)
+
+    rates = ExchangeRates(DEMO_EXCHANGE_RATES)
+    analyzer = RiskAnalyzer(bank, rates=rates)
+    processor = TransactionProcessor(bank, rates=rates, audit_log=audit_log, risk_analyzer=analyzer)
+    queue = TransactionQueue(clock=clock)
+    print(f"  Risk thresholds: {analyzer.describe_thresholds()}")
+
+    def queue_tx(description: str, created: datetime, *args: Any, **kwargs: Any) -> None:
+        tx_id = f"AU-{len(queue) + 1:02}"
+        queue.add(Transaction(*args, transaction_id=tx_id, created_at=created, **kwargs))
+        print(f"  Queued {tx_id} ({created:%d.%m %H:%M}): {description}")
+
+    def today(hour: int, minute: int = 0) -> datetime:
+        return datetime(2026, 10, 22, hour, minute)
+
+    queue_tx("John: deposit 500", today(9), "deposit", 500, receiver_id="JOHN-1001")
+    queue_tx(
+        "John: first transfer to Mary",
+        today(10),
+        "transfer",
+        300,
+        sender_id="JOHN-1001",
+        receiver_id="MARY-2001",
+    )
+    queue_tx(
+        "John: another transfer to Mary",
+        today(11),
+        "transfer",
+        200,
+        sender_id="JOHN-1001",
+        receiver_id="MARY-2001",
+    )
+    queue_tx(
+        "Mary: withdrawal 9 000, too much", today(12), "withdrawal", 9_000, sender_id="MARY-2001"
+    )
+    queue_tx("John: withdrawal 15 000", today(13), "withdrawal", 15_000, sender_id="JOHN-1001")
+    queue_tx(
+        "John: transfer 120 000 to Mary",
+        today(13, 5),
+        "transfer",
+        120_000,
+        sender_id="JOHN-1001",
+        receiver_id="MARY-2001",
+    )
+    queue_tx(
+        "John: external 10 000 at night to a new account",
+        today(2, 30),
+        "external_transfer",
+        10_000,
+        sender_id="JOHN-1001",
+        receiver_id="FR7630006000",
+    )
+    for minute in (50, 52, 54):
+        queue_tx("Mary: deposit 100", today(13, minute), "deposit", 100, receiver_id="MARY-2001")
+    queue_tx(
+        "Mary: transfer 1 000 to John right after",
+        today(13, 56),
+        "transfer",
+        1_000,
+        sender_id="MARY-2001",
+        receiver_id="JOHN-1001",
+    )
+    queue_tx(
+        "Mary: external 11 000 to a new account",
+        today(13, 58),
+        "external_transfer",
+        11_000,
+        sender_id="MARY-2001",
+        receiver_id="GB29NWBK6016",
+    )
+
+    print("\n=== Audit: processing with risk checks ===")
+    for tx in processor.run(queue):
+        print(f"  {tx}")
+
+    print("\n=== Audit: log entries of warning level and above ===")
+    for entry in audit_log.filter(min_level="warning"):
+        print(f"  {entry}")
+
+    print("\n=== Audit: reports ===")
+    report = AuditReport(audit_log, analyzer)
+    for line in report.render().splitlines():
+        print(f"  {line}")
+
+    saved = AuditLog.load(log_path)
+    print(f"\n  Audit log file: {len(saved)} entries read back from {log_path.name}")
+
+
 def main() -> None:
     demo_bank_account()
     accounts: list[BankAccount] = [*demo_savings(), *demo_premium(), *demo_investment()]
     demo_polymorphism(accounts)
     demo_bank()
     demo_transactions()
+    # The demo log goes to a temporary folder, so running the demo leaves no files behind
+    with tempfile.TemporaryDirectory() as folder:
+        demo_audit(Path(folder) / "audit.jsonl")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,8 @@ BankError (Exception)
 ├── AuthenticationError
 ├── ClientBlockedError
 ├── OperationTimeError
-└── TransactionNotFoundError
+├── TransactionNotFoundError
+└── SuspiciousOperationError
 
 AbstractAccount (ABC)                 Owner (frozen dataclass)
 │  _account_id, _owner,               AccountStatus (Enum): ACTIVE, FROZEN, CLOSED
@@ -67,6 +68,27 @@ The processor moves money only through the bank (`deposit`, `withdraw`, `transfe
 the night rule, blocked clients, the large-operation flag and every account type's own
 rules still apply. The only Day 4 changes to existing classes are `Bank.transfer()` and
 `Bank.now()`.
+
+```
+AuditLog (audit.py)                       RiskAnalyzer (risk.py)
+   _file_path, _clock                        _bank, _rates, _large_amount, _very_large_amount
+   _entries: [AuditEntry]                    _frequency_limit, _frequency_window, _block_level
+   log(), filter(), load()                   _history: [(Transaction, RiskAssessment)]
+                                             assess(), check(), assessments(), get_client_profile()
+AuditEntry (frozen dataclass)
+   timestamp, level, event, message,      AuditReport (reports.py)
+   client_id, account_id, transaction_id,    _audit_log, _risk_analyzer
+   details; to_dict(), from_dict()           suspicious_operations(), client_risk_profile(),
+                                             client_risk_profiles(), error_statistics(), render()
+AuditLevel (Enum): INFO, WARNING, ERROR, CRITICAL
+RiskLevel (Enum): LOW, MEDIUM, HIGH
+RiskFactor (Enum): LARGE_AMOUNT, VERY_LARGE_AMOUNT, FREQUENT_OPERATIONS, NEW_RECEIVER, NIGHT_TIME
+RiskAssessment, ClientRiskProfile, ErrorStatistics (frozen dataclasses)
+```
+
+Day 5 changes to existing classes: `Bank` takes an optional `audit_log` and gets
+`get_account_owner_id()`; `TransactionProcessor` takes optional `audit_log` and `risk_analyzer`.
+Without them both work exactly as before.
 
 ## Amount validation (`utils.to_money`)
 
@@ -298,6 +320,94 @@ Notes:
   number, so it goes after transactions of the same priority that were already queued.
 - Time comes from `bank.now()`, so the processor follows the same clock as the night rule.
 
+## Audit log
+
+```
+log(level, event, message, timestamp?, client_id?, account_id?, transaction_id?, details?):
+    entry = AuditEntry(timestamp or clock(), AuditLevel.parse(level), ...)
+    entries.append(entry)
+    if file_path: append json.dumps(entry.to_dict()) + "\n" to the file
+```
+
+- Levels are ordered by `severity` (INFO 0 … CRITICAL 3), so `filter(min_level="error")`
+  returns ERROR and CRITICAL. All filters are combined with AND; `since` and `until` are inclusive.
+- The file is JSON Lines: one object per line, so a new entry is appended without rewriting
+  the file. Times are ISO strings and `Decimal` details are strings, so nothing is lost to
+  float rounding. `load()` reads it back, reports the line number of a broken entry, and keeps
+  appending to the same file.
+
+What goes to the log:
+
+| Source | Event | Level |
+|---|---|---|
+| `Bank._flag` (logins, blocking, night attempts, large operations) | `suspicious_activity` | warning |
+| processor: completed | `transaction_completed` | info |
+| processor: risk factors found, allowed | `risk_flagged` | info if low, warning if medium |
+| processor: night rejection that will be retried | `transaction_retry` | warning |
+| processor: failed for good | `transaction_failed` | error |
+| processor: blocked as dangerous | `transaction_blocked` | critical |
+
+## Risk analysis
+
+```
+assess(transaction, now):
+    client = owner of the sender (or of the receiver for a deposit)
+    amount = convert(transaction amount → base currency)   # no rate: compare as is
+    amount ≥ very_large (100 000) → VERY_LARGE_AMOUNT   (4)
+    amount ≥ large      (10 000)  → LARGE_AMOUNT        (2)
+    other operations of the client created in [created_at − 10 min, created_at]
+        ≥ frequency_limit (3)     → FREQUENT_OPERATIONS (2)
+    transfer to another client's account or external transfer,
+        receiver not among the client's completed transfers → NEW_RECEIVER (1)
+    created_at in 23:00–06:00     → NIGHT_TIME          (1)
+    score = sum of points; level = LOW (< 2), MEDIUM (< 4), HIGH
+    blocked = level ≥ block_level (HIGH)
+
+check(transaction, now):   assess + remember (transaction, assessment) in the history
+```
+
+Notes:
+
+- Frequency and night use `created_at`, the moment the client made the operation. The queue
+  may process many transactions at once, and a deferred deposit may run at night; neither
+  says anything about the client's behaviour.
+- The analyzer's night (23:00–06:00) is wider than the bank's closed hours (00:00–05:00):
+  the bank refuses to work at night, the analyzer marks the hours around it as risky too.
+- A blocked attempt still counts towards frequency, so a client hammering the bank with
+  rejected operations is flagged. A receiver becomes known only after a completed transfer,
+  so a failed or blocked one does not make it trusted.
+- A night-time retry is assessed again on every attempt; `assessments()` returns only the latest
+  assessment of each transaction, so reports count every transaction once.
+
+## Blocking dangerous operations
+
+```
+process(transaction):
+    attempts += 1; now = bank.now()
+    try:
+        if risk_analyzer:
+            assessment = risk_analyzer.check(transaction, now)
+            assessment.blocked → SuspiciousOperationError
+            factors found      → audit risk_flagged
+        execute as before
+    except BankError: ... as before; audit retry / failed / blocked
+    else: audit completed
+```
+
+`SuspiciousOperationError` is not in `RETRYABLE_ERRORS`, so a blocked transaction fails at
+once, no money moves, and it appears in the processor's `error_log` like any other failure.
+
+## Reports
+
+- **Suspicious operations**: latest assessments at `min_level` (medium) or above, sorted by
+  score, highest first; equal scores keep the order they were checked in.
+- **Client risk profile**: the client's transactions counted by level and by factor, the number
+  blocked, the highest score, and the overall level, which is the highest level the client
+  reached. `client_risk_profiles()` lists every client with transactions, riskiest first.
+- **Error statistics**: counted from the audit log's processor events. Attempts are all
+  completed, retry, failed and blocked events; errors are all but completed, grouped by
+  exception name; the error rate is errors / attempts.
+
 ## Authentication
 
 ```
@@ -347,6 +457,8 @@ optionally for one client. The time comes from the bank's `clock`.
   and `bank.py` only coordinates clients and accounts and applies the security rules.
   In `transactions.py`, `Transaction` holds data and its status, `TransactionQueue` only orders
   and stores, and `TransactionProcessor` applies the transaction rules.
+  `AuditLog` only stores and filters entries, `RiskAnalyzer` only scores, and `AuditReport`
+  only summarises what the other two collected.
 - **Open/closed.** The Day 2 account types were added by subclassing `BankAccount`;
   the only change to existing code was extracting `_debit` from `withdraw` so the
   subclasses can reuse it. Status rules are data (`_ALLOWED_TRANSITIONS`,
@@ -367,4 +479,6 @@ optionally for one client. The time comes from the bank's `clock`.
   as an argument instead of looking them up, so the account does not depend on any
   source of market data. `Bank` gets its `clock` the same way, so the night rule does not
   depend on the real time. `TransactionProcessor` gets the bank and the `ExchangeRates`
-  as parameters, and its fee rate, retry count and delay are settings.
+  as parameters, and its fee rate, retry count and delay are settings. The audit log and the
+  risk analyzer are passed in the same way, so the processor works with or without them, and
+  the risk thresholds and weights are settings and class attributes, not hard-coded checks.

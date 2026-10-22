@@ -8,6 +8,8 @@ with their own withdrawal rules and extra features.
 `Bank` manages `Client`s and their accounts, with PIN logins and security rules.
 `Transaction`, `TransactionQueue` and `TransactionProcessor` run money operations
 through a priority queue, with fees, currency conversion and retries.
+`AuditLog`, `RiskAnalyzer` and `AuditReport` record every event, score transactions for
+signs of fraud, block dangerous ones and report on them.
 
 All data lives in memory: there is no database, no external API and no real market data.
 Exchange rates are fixed values passed in by the caller.
@@ -78,6 +80,35 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 - `Bank.transfer()` moves money between two accounts as one operation: if the receiver
   rejects it, the sender gets the money back
 
+### Audit and risk analysis (Day 5)
+
+- `AuditLog`: every entry has a time, a level (`info`, `warning`, `error`, `critical`), an event
+  name, a message, the client, account and transaction involved, and extra details
+  - kept in memory and, if a file path is given, appended to a JSON Lines file;
+    `AuditLog.load(path)` reads the file back
+  - `filter()` by exact level or minimum level, event, client, account, transaction and time range
+  - `Bank(audit_log=...)` also writes its suspicious activity (logins, night attempts, large
+    operations) to the log as warnings
+- `RiskAnalyzer` scores every transaction; each factor adds points:
+
+  | Factor | Rule (defaults) | Points |
+  |---|---|---|
+  | large amount | 10 000 or more in the base currency (USD) | 2 |
+  | very large amount | 100 000 or more | 4 |
+  | frequent operations | the client already made 3 operations in the last 10 minutes | 2 |
+  | new receiver | a transfer to another client's or an external account the client has never paid | 1 |
+  | night | made from 23:00 to 06:00 | 1 |
+
+  The total gives the risk level: 0–1 low, 2–3 medium, 4 or more high.
+  Amounts in other currencies are converted with `ExchangeRates`.
+- Blocking: `TransactionProcessor(risk_analyzer=..., audit_log=...)` checks the risk before any
+  money moves. A high-risk transaction fails with `SuspiciousOperationError` and is not retried
+  (`block_level="medium"` makes the rule stricter); a medium-risk one goes through with a warning
+  in the audit log
+- Reports (`AuditReport`): suspicious operations (medium and high, riskiest first), a client's
+  risk profile (operations by level, blocked, factors, overall level) and error statistics
+  (attempts, errors by type, failed, blocked and retried, error rate); `render()` prints all three
+
 ## Project structure
 
 ```
@@ -90,13 +121,18 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── clients.py     # Client, ClientStatus
 │   ├── bank.py        # Bank, SuspiciousActivity, ClientRank
 │   ├── transactions.py  # Transaction, TransactionQueue, TransactionProcessor, ExchangeRates
+│   ├── audit.py       # AuditLog, AuditEntry, AuditLevel
+│   ├── risk.py        # RiskAnalyzer, RiskAssessment, RiskLevel, RiskFactor, ClientRiskProfile
+│   ├── reports.py     # AuditReport, ErrorStatistics
 │   ├── utils.py       # money and rate validation, ID generation, formatting
 │   └── exceptions.py  # custom exceptions
 ├── tests/
 │   ├── test_main.py       # BankAccount, utils
 │   ├── test_accounts.py   # savings, premium and investment accounts
 │   ├── test_bank.py       # clients, bank operations, logins, security rules, reports
-│   └── test_transactions.py  # transactions, queue, processor rules, ten transactions end to end
+│   ├── test_transactions.py  # transactions, queue, processor rules, ten transactions end to end
+│   ├── test_audit.py      # audit log: levels, file, filters, bank integration
+│   └── test_risk.py       # risk factors, blocking, reports, ordinary and suspicious transactions
 └── docs/
     └── algorithm.md   # algorithms and design
 ```
@@ -186,6 +222,25 @@ usd.balance              # Decimal('2910.00'): 5 000 − (1 000 + 1% fee) − 1 
 eur.balance              # Decimal('1000.00')
 ```
 
+### Audit and risk
+
+```python
+from audit import AuditLog
+from reports import AuditReport
+from risk import RiskAnalyzer
+
+audit_log = AuditLog("audit.jsonl")              # memory + file
+bank = Bank("Training Bank", audit_log=audit_log)
+# ... clients and accounts ...
+analyzer = RiskAnalyzer(bank, rates=rates)
+processor = TransactionProcessor(bank, rates=rates, audit_log=audit_log, risk_analyzer=analyzer)
+
+tx = processor.process(Transaction("transfer", 120_000, sender_id="JOHN-1001", receiver_id="MARY-2001"))
+tx.failure_reason      # 'SuspiciousOperationError: Transaction ... blocked, high risk: very large amount'
+audit_log.filter(min_level="error", client_id=john.client_id)
+print(AuditReport(audit_log, analyzer).render())
+```
+
 The demo (`python src/main.py`) creates two accounts of each type, runs valid and invalid
 operations on them, and then calls `withdraw()`, `__str__()` and `get_account_info()`
 on all of them through one loop. The growth rates in the demo (stocks 10%, bonds 4%,
@@ -198,5 +253,9 @@ rejected transfers from a regular account and to a frozen one, an urgent withdra
 a deferred deposit and a cancelled one), then runs the queue in the afternoon, at 04:30
 (the deferred deposit is rejected for the night and retried) and at 05:00, and prints
 the balances and the error log. Its exchange rates are made-up values too.
+The audit part runs twelve ordinary and suspicious transactions through the risk checks
+(a large withdrawal, a very large transfer, a night transfer to a new account, a burst of
+operations followed by a large external transfer), prints the warnings and blocked operations
+from the audit log and the three reports, and reads the log file back from a temporary folder.
 
 See [docs/algorithm.md](docs/algorithm.md) for how validation, statuses and the class design work.
