@@ -10,6 +10,8 @@ with their own withdrawal rules and extra features.
 through a priority queue, with fees, currency conversion and retries.
 `AuditLog`, `RiskAnalyzer` and `AuditReport` record every event, score transactions for
 signs of fraud, block dangerous ones and report on them.
+`TransactionReport` adds bank-wide reports, and the demo ends with a simulation of a whole
+banking day.
 
 All data lives in memory: there is no database, no external API and no real market data.
 Exchange rates are fixed values passed in by the caller.
@@ -109,6 +111,27 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
   risk profile (operations by level, blocked, factors, overall level) and error statistics
   (attempts, errors by type, failed, blocked and retried, error rate); `render()` prints all three
 
+### Demo simulation (Day 6)
+
+`demo_simulation()` in `main.py` runs one bank through a whole day:
+
+- **Setup**: 7 clients and 13 accounts of every type and in all five currencies; one account
+  frozen, part of an investment account invested
+- **Simulation**: 39 transactions through the queue, plus 3 rejected before it (negative amount,
+  unsupported currency, the same sender and receiver). Among them:
+  - failures: not enough money, a frozen or unknown account, below a savings minimum, invested
+    money, an external transfer inside the bank, a regular account going into the minus
+  - suspicious ones: large amounts and new receivers (allowed with a warning), a very large
+    transfer, a night transfer to a new account and a burst of operations (blocked)
+  - an urgent transaction, a deferred one retried after the night, and a cancelled one
+- **Logging**: the queue writes `transaction_queued` and `transaction_cancelled` to the audit log
+  (`TransactionQueue(audit_log=...)`); the demo prints the count of every event and the full
+  trail of a completed, a failed, a blocked and a retried transaction
+- **Client view**: John Smith's accounts, transaction history and suspicious operations
+- **Reports** (`TransactionReport`): top-3 clients, transaction statistics (by status and type,
+  success rate, volume, fees) and the total balance per currency and in USD.
+  The report converts currencies with `ExchangeRates`; `Bank` itself still never mixes them
+
 ## Project structure
 
 ```
@@ -123,7 +146,7 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── transactions.py  # Transaction, TransactionQueue, TransactionProcessor, ExchangeRates
 │   ├── audit.py       # AuditLog, AuditEntry, AuditLevel
 │   ├── risk.py        # RiskAnalyzer, RiskAssessment, RiskLevel, RiskFactor, ClientRiskProfile
-│   ├── reports.py     # AuditReport, ErrorStatistics
+│   ├── reports.py     # AuditReport, ErrorStatistics, TransactionReport, TransactionStatistics
 │   ├── utils.py       # money and rate validation, ID generation, formatting
 │   └── exceptions.py  # custom exceptions
 ├── tests/
@@ -132,7 +155,8 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── test_bank.py       # clients, bank operations, logins, security rules, reports
 │   ├── test_transactions.py  # transactions, queue, processor rules, ten transactions end to end
 │   ├── test_audit.py      # audit log: levels, file, filters, bank integration
-│   └── test_risk.py       # risk factors, blocking, reports, ordinary and suspicious transactions
+│   ├── test_risk.py       # risk factors, blocking, reports, ordinary and suspicious transactions
+│   └── test_reports.py    # queue logging, transaction report, the Day 6 simulation
 └── docs/
     └── algorithm.md   # algorithms and design
 ```
@@ -241,6 +265,19 @@ audit_log.filter(min_level="error", client_id=john.client_id)
 print(AuditReport(audit_log, analyzer).render())
 ```
 
+### Bank-wide reports
+
+```python
+from reports import TransactionReport
+
+report = TransactionReport(bank, transactions, rates)   # currencies converted to rates.base
+report.client_history(john.client_id)   # transactions touching John's accounts, oldest first
+report.statistics()                     # TransactionStatistics(total=..., by_status=..., ...)
+report.top_clients(3)                   # [ClientRank(position=1, client=..., total=...), ...]
+report.total_balance()                  # all open accounts, in USD
+print(report.render())
+```
+
 The demo (`python src/main.py`) creates two accounts of each type, runs valid and invalid
 operations on them, and then calls `withdraw()`, `__str__()` and `get_account_info()`
 on all of them through one loop. The growth rates in the demo (stocks 10%, bonds 4%,
@@ -257,5 +294,6 @@ The audit part runs twelve ordinary and suspicious transactions through the risk
 (a large withdrawal, a very large transfer, a night transfer to a new account, a burst of
 operations followed by a large external transfer), prints the warnings and blocked operations
 from the audit log and the three reports, and reads the log file back from a temporary folder.
+The last part is the Day 6 simulation described above.
 
 See [docs/algorithm.md](docs/algorithm.md) for how validation, statuses and the class design work.

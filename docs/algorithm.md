@@ -90,6 +90,16 @@ Day 5 changes to existing classes: `Bank` takes an optional `audit_log` and gets
 `get_account_owner_id()`; `TransactionProcessor` takes optional `audit_log` and `risk_analyzer`.
 Without them both work exactly as before.
 
+```
+TransactionReport (reports.py)
+   _bank, _transactions: [Transaction], _rates: ExchangeRates
+   client_history(), statistics(), total_balance(), top_clients(), render()
+TransactionStatistics (frozen dataclass): total, by_status, by_type, volume, fees, success_rate
+```
+
+Day 6 adds `TransactionReport` and gives `TransactionQueue` an optional `audit_log`;
+nothing else changes.
+
 ## Amount validation (`utils.to_money`)
 
 Every amount — initial balance, deposit, withdrawal — goes through one function:
@@ -278,6 +288,11 @@ then. `pop_next(now)` removes and returns the first due transaction; `cancel(id)
 it and marks it `CANCELLED`. The queue sorts on every call, which is enough for a training
 model; a heap would be the choice for many transactions.
 
+With an `audit_log`, `add()` writes `transaction_queued` and `cancel()` writes
+`transaction_cancelled`. A transaction the processor puts back for a retry is logged as
+queued again, with its attempt number and the new time. The queue does not know the bank,
+so these entries name the account but not the client.
+
 ### Processor
 
 ```
@@ -341,6 +356,8 @@ What goes to the log:
 | Source | Event | Level |
 |---|---|---|
 | `Bank._flag` (logins, blocking, night attempts, large operations) | `suspicious_activity` | warning |
+| queue: added (or put back for a retry) | `transaction_queued` | info |
+| queue: cancelled | `transaction_cancelled` | info |
 | processor: completed | `transaction_completed` | info |
 | processor: risk factors found, allowed | `risk_flagged` | info if low, warning if medium |
 | processor: night rejection that will be retried | `transaction_retry` | warning |
@@ -407,6 +424,20 @@ once, no money moves, and it appears in the processor's `error_log` like any oth
 - **Error statistics**: counted from the audit log's processor events. Attempts are all
   completed, retry, failed and blocked events; errors are all but completed, grouped by
   exception name; the error rate is errors / attempts.
+
+`TransactionReport` works over a list of transactions and the bank. `Bank` never mixes
+currencies, so this report converts them to `rates.base` (USD):
+
+- **Client history**: the transactions whose sender or receiver is one of the client's
+  accounts, sorted by `created_at`.
+- **Statistics**: counts by status and by type; volume and fees add up only completed
+  transactions; the success rate is completed / (completed + failed), so cancelled ones
+  do not count against it.
+- **Total balance**: `Bank.get_total_balance()` of each currency, converted and added.
+- **Top clients**: `Bank.get_clients_ranking()` of each currency, converted and added per
+  client, then sorted the same way (total descending, ties by name). A premium account in
+  overdraft makes a total negative; `ExchangeRates.convert()` accepts only positive amounts,
+  so the report converts the absolute value and puts the sign back.
 
 ## Authentication
 

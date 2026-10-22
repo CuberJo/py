@@ -295,12 +295,21 @@ class TransactionQueue:
     """Pending transactions in processing order: higher priority first, then the order added.
 
     A transaction with ``scheduled_at`` in the future stays in the queue until
-    that time.
+    that time. With an ``audit_log`` every queued and cancelled transaction is
+    recorded there.
     """
 
-    def __init__(self, *, clock: Callable[[], datetime] = datetime.now):
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] = datetime.now,
+        audit_log: Optional[AuditLog] = None,
+    ):
         # The clock is injected so tests and the demo can control the time
+        if audit_log is not None and not isinstance(audit_log, AuditLog):
+            raise InvalidOperationError("audit_log must be an AuditLog instance")
         self._clock = clock
+        self._audit_log = audit_log
         self._entries: dict[str, tuple[int, Transaction]] = {}  # id -> (sequence, transaction)
         self._sequence = itertools.count()
 
@@ -317,6 +326,12 @@ class TransactionQueue:
                 f"Transaction {transaction.transaction_id} is already in the queue"
             )
         self._entries[transaction.transaction_id] = (next(self._sequence), transaction)
+        if transaction.attempts:
+            # The processor puts a transaction back after an error that can be retried
+            message = f"Queued again for {transaction.scheduled_at:%Y-%m-%d %H:%M}: {transaction}"
+        else:
+            message = f"Queued: {transaction}"
+        self._audit(AuditLevel.INFO, "transaction_queued", message, transaction)
         return transaction
 
     def cancel(self, transaction_id: str, reason: str = "Cancelled") -> Transaction:
@@ -326,6 +341,7 @@ class TransactionQueue:
             raise TransactionNotFoundError(transaction_id)
         transaction = entry[1]
         transaction.cancel(self._clock(), reason)
+        self._audit(AuditLevel.INFO, "transaction_cancelled", reason, transaction)
         return transaction
 
     def pending(self) -> list[Transaction]:
@@ -345,6 +361,20 @@ class TransactionQueue:
             return None
         del self._entries[ready[0].transaction_id]
         return ready[0]
+
+    def _audit(self, level: AuditLevel, event: str, message: str, transaction: Transaction) -> None:
+        if self._audit_log is None:
+            return
+        # The queue does not know the bank, so the entry names the account, not the client
+        self._audit_log.log(
+            level,
+            event,
+            message,
+            timestamp=self._clock(),
+            account_id=transaction.sender_id or transaction.receiver_id,
+            transaction_id=transaction.transaction_id,
+            details={"priority": transaction.priority, "attempt": transaction.attempts},
+        )
 
     @staticmethod
     def _order(entry: tuple[int, Transaction]) -> tuple[int, int]:

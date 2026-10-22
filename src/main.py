@@ -1,7 +1,9 @@
-"""Demo of all account types, the bank, transactions, and the audit and risk analysis."""
+"""Demo of all account types, the bank, transactions, the audit and risk analysis,
+and a simulation of a whole banking day."""
 
 import tempfile
-from datetime import date, datetime
+from collections import Counter
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,14 +13,108 @@ from bank import Bank
 from clients import Client
 from exceptions import BankError
 from models import AccountStatus, BankAccount, Owner
-from reports import AuditReport
+from reports import AuditReport, TransactionReport
 from risk import RiskAnalyzer
-from transactions import ExchangeRates, Transaction, TransactionProcessor, TransactionQueue
+from transactions import (
+    ExchangeRates,
+    Transaction,
+    TransactionProcessor,
+    TransactionQueue,
+    TransactionStatus,
+)
 
 # Illustrative yearly rates for the training model, not real market data
 DEMO_GROWTH_RATES = {"stocks": 0.10, "bonds": 0.04, "etf": 0.07}
 # Illustrative exchange rates: the value of one unit in USD
 DEMO_EXCHANGE_RATES = {"EUR": "1.08", "RUB": "0.011", "KZT": "0.002", "CNY": "0.14"}
+
+# The simulated day: clients make their operations on 22.10, the bank processes them at 14:00
+SIMULATION_DAY = date(2026, 10, 22)
+SIMULATION_RUN = datetime(2026, 10, 22, 14, 0)
+SIMULATION_NIGHT = datetime(2026, 10, 23, 4, 30)
+# Clients: ID, name, birth date, PIN
+SIMULATION_CLIENTS = [
+    ("CL-001", "John Smith", date(1985, 3, 12), "1234"),
+    ("CL-002", "Mary Williams", date(1992, 7, 30), "5678"),
+    ("CL-003", "Robert Miller", date(1978, 1, 5), "9012"),
+    ("CL-004", "Linda Moore", date(1990, 11, 2), "3456"),
+    ("CL-005", "Michael Wilson", date(1983, 6, 18), "7890"),
+    ("CL-006", "Jennifer Davis", date(1995, 2, 24), "2468"),
+    ("CL-007", "Tyler Brown", date(2001, 9, 9), "1357"),
+]
+# Accounts: client, account class, constructor arguments
+SIMULATION_ACCOUNTS: list[tuple[str, type[BankAccount], dict[str, Any]]] = [
+    ("CL-001", BankAccount, {"account_id": "JOHN-1001", "balance": 25_000}),
+    ("CL-001", BankAccount, {"account_id": "JOHN-1002", "balance": 4_000, "currency": "EUR"}),
+    ("CL-001", SavingsAccount, {"account_id": "JOHN-1003", "balance": 30_000, "min_balance": 10_000}),
+    ("CL-002", PremiumAccount, {"account_id": "MARY-2001", "balance": 400_000}),
+    ("CL-002", BankAccount, {"account_id": "MARY-2002", "balance": 8_000}),
+    ("CL-003", InvestmentAccount, {"account_id": "ROB-3001", "balance": 150_000}),
+    ("CL-003", BankAccount, {"account_id": "ROB-3002", "balance": 900_000, "currency": "RUB"}),
+    ("CL-004", BankAccount, {"account_id": "LINDA-4001", "balance": 3_000}),
+    ("CL-004", SavingsAccount, {"account_id": "LINDA-4002", "balance": 12_000, "min_balance": 5_000}),
+    ("CL-005", BankAccount, {"account_id": "MIKE-5001", "balance": 2_500_000, "currency": "KZT"}),
+    ("CL-005", BankAccount, {"account_id": "MIKE-5002", "balance": 40_000, "currency": "CNY"}),
+    ("CL-006", BankAccount, {"account_id": "JEN-6001", "balance": 6_000}),
+    ("CL-007", BankAccount, {"account_id": "TYLER-7001", "balance": 1_500}),
+]  # fmt: skip
+# Transactions in the order the clients made them:
+# time, description, type, amount, currency, sender, receiver, optional extra arguments
+SIMULATION_TRANSACTIONS: list[tuple[Any, ...]] = [
+    ("02:30", "John: night external 10 000 to a new account",
+     "external_transfer", 10_000, "USD", "JOHN-1001", "CH9300762011"),
+    ("03:10", "Linda: night transfer to Tyler", "transfer", 200, "USD", "LINDA-4001", "TYLER-7001"),
+    ("08:00", "John: salary", "deposit", 2_000, "USD", None, "JOHN-1001"),
+    ("08:15", "Linda: salary", "deposit", 1_200, "USD", None, "LINDA-4001"),
+    ("08:30", "Tyler: cash deposit", "deposit", 500, "USD", None, "TYLER-7001"),
+    ("08:45", "John: pays Mary", "transfer", 300, "USD", "JOHN-1001", "MARY-2002"),
+    ("09:00", "John: EUR to his USD account", "transfer", 1_000, "EUR", "JOHN-1002", "JOHN-1001"),
+    ("09:15", "Linda: cash withdrawal", "withdrawal", 400, "USD", "LINDA-4001", None),
+    ("09:30", "Robert: RUB to Tyler", "transfer", 50_000, "RUB", "ROB-3002", "TYLER-7001"),
+    ("09:45", "Mary: external 2 000 (1% fee)",
+     "external_transfer", 2_000, "USD", "MARY-2002", "DE89370400440532"),
+    ("10:00", "Michael: KZT deposit", "deposit", 100_000, "KZT", None, "MIKE-5001"),
+    ("10:10", "Michael: CNY to Linda", "transfer", 5_000, "CNY", "MIKE-5002", "LINDA-4001"),
+    ("10:20", "Tyler: withdraw more than he has", "withdrawal", 3_000, "USD", "TYLER-7001", None),
+    ("10:30", "Deposit to Jennifer's frozen account", "deposit", 50, "USD", None, "JEN-6001"),
+    ("10:40", "Tyler: transfer to an unknown account",
+     "transfer", 100, "USD", "TYLER-7001", "NOPE-0000"),
+    ("10:50", "John: savings below the minimum", "withdrawal", 25_000, "USD", "JOHN-1003", None),
+    ("11:00", "John: large savings withdrawal", "withdrawal", 15_000, "USD", "JOHN-1003", None),
+    ("11:10", "Robert: withdraw invested money", "withdrawal", 95_000, "USD", "ROB-3001", None),
+    ("11:20", "John: external transfer inside the bank",
+     "external_transfer", 1_000, "USD", "JOHN-1001", "JOHN-1002"),
+    ("11:30", "Mary: transfer 120 000 to John",
+     "transfer", 120_000, "USD", "MARY-2001", "JOHN-1001"),
+    ("11:40", "Mary: transfer 20 000 to Robert", "transfer", 20_000, "USD", "MARY-2001", "ROB-3001"),
+    ("11:50", "Linda: savings to her USD account",
+     "transfer", 2_000, "USD", "LINDA-4002", "LINDA-4001"),
+    ("12:00", "Linda: savings below the minimum",
+     "transfer", 9_000, "USD", "LINDA-4002", "MARY-2002"),
+    ("12:10", "Mary: regular account into the minus",
+     "withdrawal", 20_000, "USD", "MARY-2002", None),
+    ("12:20", "Robert: RUB to John's EUR account",
+     "transfer", 400_000, "RUB", "ROB-3002", "JOHN-1002"),
+    ("12:30", "Tyler: cash deposit", "deposit", 300, "USD", None, "TYLER-7001"),
+    ("12:40", "Mary: pays Tyler", "transfer", 600, "USD", "MARY-2001", "TYLER-7001"),
+    ("13:00", "Tyler: deposit 100", "deposit", 100, "USD", None, "TYLER-7001"),
+    ("13:02", "Tyler: deposit 100", "deposit", 100, "USD", None, "TYLER-7001"),
+    ("13:04", "Tyler: deposit 100", "deposit", 100, "USD", None, "TYLER-7001"),
+    ("13:06", "Tyler: transfer to Linda right after",
+     "transfer", 1_000, "USD", "TYLER-7001", "LINDA-4001"),
+    ("13:08", "Tyler: external 10 000 right after",
+     "external_transfer", 10_000, "USD", "TYLER-7001", "FR7630006000"),
+    ("13:15", "John: pays Mary again", "transfer", 700, "USD", "JOHN-1001", "MARY-2002"),
+    ("13:20", "Mary: premium to her USD account",
+     "transfer", 3_000, "USD", "MARY-2001", "MARY-2002"),
+    ("13:30", "Michael: KZT deposit", "deposit", 1_000_000, "KZT", None, "MIKE-5001"),
+    ("13:40", "Michael: CNY cash withdrawal", "withdrawal", 1_000, "CNY", "MIKE-5002", None),
+    ("13:50", "John: urgent withdrawal (priority 10)",
+     "withdrawal", 500, "USD", "JOHN-1001", None, {"priority": 10}),
+    ("13:55", "Deferred deposit to Mary at 04:30 tomorrow",
+     "deposit", 250, "USD", None, "MARY-2002", {"scheduled_at": SIMULATION_NIGHT}),
+    ("13:58", "Deposit to be cancelled", "deposit", 5_000, "USD", None, "JOHN-1001"),
+]  # fmt: skip
 
 
 def attempt(description: str, operation: Callable[[], Any]) -> None:
@@ -480,6 +576,105 @@ def demo_audit(log_path: Path) -> None:
     print(f"\n  Audit log file: {len(saved)} entries read back from {log_path.name}")
 
 
+def demo_simulation() -> None:
+    clock = DemoClock(SIMULATION_RUN)
+    audit_log = AuditLog(clock=clock)
+    bank = Bank("Training Bank", clock=clock, audit_log=audit_log)
+    rates = ExchangeRates(DEMO_EXCHANGE_RATES)
+    analyzer = RiskAnalyzer(bank, rates=rates)
+    processor = TransactionProcessor(bank, rates=rates, audit_log=audit_log, risk_analyzer=analyzer)
+    queue = TransactionQueue(clock=clock, audit_log=audit_log)
+
+    print("\n=== Simulation: the bank, its clients and accounts ===")
+    for client_id, name, birth_date, pin in SIMULATION_CLIENTS:
+        bank.add_client(Client(name, birth_date, pin, client_id=client_id))
+    for client_id, account_class, kwargs in SIMULATION_ACCOUNTS:
+        bank.open_account(client_id, account_class, **kwargs)
+    bank.get_account("ROB-3001").invest("stocks", 60_000)
+    bank.freeze_account("JEN-6001")
+    print(f"  {bank.name}: {len(bank.clients)} clients, {len(bank.search_accounts())} accounts")
+    for client in bank.clients:
+        print(f"  {client.client_id} {client.full_name}: {', '.join(client.account_ids)}")
+    print("  JEN-6001 is frozen, ROB-3001 has 60 000 invested in stocks")
+
+    print("\n=== Simulation: transactions rejected before the queue ===")
+    attempt("Deposit -500", lambda: Transaction("deposit", -500, receiver_id="JOHN-1001"))
+    attempt("Deposit in GBP", lambda: Transaction("deposit", 10, "GBP", receiver_id="JOHN-1001"))
+    attempt(
+        "Transfer to the same account",
+        lambda: Transaction("transfer", 10, sender_id="JOHN-1001", receiver_id="JOHN-1001"),
+    )
+
+    print("\n=== Simulation: queueing ===")
+    transactions: list[Transaction] = []
+    descriptions: dict[str, str] = {}
+    for row in SIMULATION_TRANSACTIONS:
+        when, description, kind, amount, currency, sender, receiver, *extra = row
+        tx = Transaction(
+            kind,
+            amount,
+            currency,
+            sender_id=sender,
+            receiver_id=receiver,
+            transaction_id=f"SIM-{len(transactions) + 1:02}",
+            created_at=datetime.combine(SIMULATION_DAY, time.fromisoformat(when)),
+            **(extra[0] if extra else {}),
+        )
+        transactions.append(queue.add(tx))
+        descriptions[tx.transaction_id] = description
+    queued = audit_log.filter(event="transaction_queued")
+    print(f"  {len(queued)} transactions queued, the audit log has an entry for each:")
+    for entry in queued[:3]:
+        print(f"    {entry}")
+    print(f"    ... {len(queued) - 3} more")
+    last_id = transactions[-1].transaction_id
+    attempt(f"Cancel {last_id}", lambda: queue.cancel(last_id, "Cancelled by the client"))
+
+    print("\n=== Simulation: processing ===")
+    for when in (SIMULATION_RUN, SIMULATION_NIGHT, SIMULATION_NIGHT.replace(hour=5, minute=0)):
+        clock.now = when
+        processed = processor.run(queue)
+        print(f"  Run at {when:%Y-%m-%d %H:%M}: processed {len(processed)}, left {len(queue)}")
+        for tx in processed:
+            mark = {"completed": "OK", "failed": "FAIL"}.get(tx.status.value, "WAIT")
+            reason = f" -> {tx.failure_reason}" if tx.failure_reason else ""
+            print(f"    [{mark}] {tx.transaction_id} {descriptions[tx.transaction_id]}{reason}")
+
+    print("\n=== Simulation: the audit log ===")
+    events = Counter(entry.event for entry in audit_log.entries)
+    print(f"  {len(audit_log)} entries: " + ", ".join(f"{e} {n}" for e, n in events.items()))
+    statuses = Counter(tx.status for tx in transactions)
+    print("  Transactions: " + ", ".join(f"{s.value} {n}" for s, n in statuses.items()))
+    # One transaction of each outcome, from queueing to the result
+    samples = [
+        next(tx.transaction_id for tx in transactions if tx.status is TransactionStatus.COMPLETED),
+        audit_log.filter(event="transaction_failed")[0].transaction_id,
+        audit_log.filter(event="transaction_blocked")[0].transaction_id,
+        audit_log.filter(event="transaction_retry")[0].transaction_id,
+    ]
+    for tx_id in samples:
+        print(f"  {tx_id} {descriptions[tx_id]}:")
+        for entry in audit_log.filter(transaction_id=tx_id):
+            print(f"    {entry}")
+
+    report = TransactionReport(bank, transactions, rates)
+    john = bank.get_client("CL-001")
+    print(f"\n=== Simulation: client {john.full_name} ===")
+    print("  Accounts:")
+    for account in bank.search_accounts(client_id=john.client_id):
+        print(f"    {account}")
+    print("  History:")
+    for tx in report.client_history(john.client_id):
+        print(f"    {tx.created_at:%H:%M} | {tx}")
+    print("  Suspicious operations:")
+    for assessment in analyzer.assessments(client_id=john.client_id, min_level="medium"):
+        print(f"    {assessment}")
+
+    print("\n=== Simulation: reports ===")
+    for line in report.render().splitlines():
+        print(f"  {line}")
+
+
 def main() -> None:
     demo_bank_account()
     accounts: list[BankAccount] = [*demo_savings(), *demo_premium(), *demo_investment()]
@@ -489,6 +684,7 @@ def main() -> None:
     # The demo log goes to a temporary folder, so running the demo leaves no files behind
     with tempfile.TemporaryDirectory() as folder:
         demo_audit(Path(folder) / "audit.jsonl")
+    demo_simulation()
 
 
 if __name__ == "__main__":
