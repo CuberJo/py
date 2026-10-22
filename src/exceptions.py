@@ -1,9 +1,14 @@
-"""Domain exceptions raised by account operations."""
+"""Domain exceptions raised by account and bank operations."""
 
 from decimal import Decimal
+from typing import Optional
 
 
-class AccountError(Exception):
+class BankError(Exception):
+    """Base class for every error of the bank model."""
+
+
+class AccountError(BankError):
     """Base class for every account-related error."""
 
 
@@ -49,3 +54,51 @@ class LimitExceededError(AccountError):
         )
         self.limit = limit
         self.requested = requested
+
+
+class AgeRestrictionError(InvalidOperationError):
+    """The client is younger than the minimum age."""
+
+    def __init__(self, age: int, minimum: int):
+        super().__init__(f"Client must be at least {minimum} years old, got {age}")
+        self.age = age
+        self.minimum = minimum
+
+
+class ClientNotFoundError(BankError):
+    """No client with this ID is registered in the bank."""
+
+    def __init__(self, client_id: str):
+        super().__init__(f"Client {client_id} not found")
+        self.client_id = client_id
+
+
+class AccountNotFoundError(BankError):
+    """No account with this number is registered in the bank."""
+
+    def __init__(self, account_id: str):
+        super().__init__(f"Account {account_id} not found")
+        self.account_id = account_id
+
+
+class AuthenticationError(BankError):
+    """Wrong client ID or PIN."""
+
+    def __init__(self, attempts_left: Optional[int] = None):
+        message = "Wrong client ID or PIN"
+        if attempts_left is not None:
+            message += f", attempts left: {attempts_left}"
+        super().__init__(message)
+        self.attempts_left = attempts_left
+
+
+class ClientBlockedError(BankError):
+    """The client is blocked, for example after too many failed logins."""
+
+    def __init__(self, client_id: str):
+        super().__init__(f"Client {client_id} is blocked, operations are not allowed")
+        self.client_id = client_id
+
+
+class OperationTimeError(BankError):
+    """The operation is not allowed at this time of day."""

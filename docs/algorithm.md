@@ -3,12 +3,19 @@
 ## Class overview
 
 ```
-AccountError (Exception)
-├── AccountFrozenError
-├── AccountClosedError
-├── InvalidOperationError
-├── InsufficientFundsError
-└── LimitExceededError
+BankError (Exception)
+├── AccountError
+│   ├── AccountFrozenError
+│   ├── AccountClosedError
+│   ├── InvalidOperationError
+│   │   └── AgeRestrictionError
+│   ├── InsufficientFundsError
+│   └── LimitExceededError
+├── ClientNotFoundError
+├── AccountNotFoundError
+├── AuthenticationError
+├── ClientBlockedError
+└── OperationTimeError
 
 AbstractAccount (ABC)                 Owner (frozen dataclass)
 │  _account_id, _owner,               AccountStatus (Enum): ACTIVE, FROZEN, CLOSED
@@ -25,6 +32,19 @@ AbstractAccount (ABC)                 Owner (frozen dataclass)
 
 `SavingsAccount`, `PremiumAccount` and `InvestmentAccount` live in `accounts.py` and
 override `withdraw()`, `get_account_info()` and `__str__()`.
+
+```
+Client (clients.py)                       Bank (bank.py)
+   _client_id, _full_name, _birth_date       _clients:        client_id → Client
+   _phone, _email, _status                   _accounts:       account_id → BankAccount
+   _pin_salt, _pin_hash                      _account_owners: account_id → client_id
+   _account_ids                              _failed_logins:  client_id → count
+   check_pin(), block(), unblock()           _suspicious:     [SuspiciousActivity]
+   link_account(), as_owner()                _clock:          () → datetime
+```
+
+The bank holds clients and accounts; accounts do not know about the bank, so the
+account classes did not change for Day 3.
 
 ## Amount validation (`utils.to_money`)
 
@@ -140,6 +160,74 @@ ACTIVE ─────────────► FROZEN
 - A transition not in the table (e.g. freezing a frozen account) raises `InvalidOperationError`.
 - `close()` additionally requires a zero balance so money cannot get stuck on a closed account.
 
+## Client
+
+- The age is counted in full years: `today.year − birth.year`, minus one if this year's
+  birthday has not come yet. Under 18 → `AgeRestrictionError`; a future birth date is rejected.
+  `today` can be passed to the constructor so the check is testable on fixed dates.
+- Phone: spaces, dashes and brackets are removed, then it must be an optional `+` and
+  10–15 digits. Email is checked by `Owner` (it must contain `@`).
+- PIN: 4–6 digits. Only `sha256(salt + pin)` with a random 16-byte salt is kept;
+  `check_pin` compares hashes with `hmac.compare_digest`.
+- `account_ids` is returned as a tuple, so accounts are linked only by the bank.
+  Closed accounts stay in the list as history.
+
+## Bank operations
+
+Every operation on an existing account goes through the same checks, in this order:
+
+```
+_get_operable_account(account_id, action):
+    account = get_account(account_id)        # unknown → AccountNotFoundError
+    _ensure_working_hours(action)            # 00:00 ≤ now < 05:00 → flag + OperationTimeError
+    _get_active_client(owner)                # blocked → ClientBlockedError
+    return account
+```
+
+| Method | Night check | Owner must be active | Then |
+|---|---|---|---|
+| `open_account(client_id, account_class, **kwargs)` | yes | yes | create with `client.as_owner()`, register, link to client |
+| `close_account` | yes | yes | `account.close()` (zero balance required) |
+| `freeze_account` | no | no | `account.freeze()` — protective, always allowed |
+| `unfreeze_account` | yes | yes | `account.unfreeze()` |
+| `deposit` / `withdraw` | yes | yes | flag if amount ≥ 1 000 000, then the account's own method |
+
+Account rules (frozen, closed, limits, minimum balance) are still checked by the account itself.
+
+## Authentication
+
+```
+authenticate_client(client_id, pin):
+    unknown ID      → flag, AuthenticationError()      # same error as a wrong PIN
+    client blocked  → flag, ClientBlockedError
+    right PIN       → reset the counter, return client
+    wrong PIN       → counter += 1
+                      counter == 3 → block client, reset counter, flag, ClientBlockedError
+                      otherwise    → AuthenticationError(attempts_left = 3 − counter)
+```
+
+The counter is per client and counts wrong PINs in a row. `unblock_client()` makes the
+client active again and resets the counter.
+
+## Suspicious activity
+
+`SuspiciousActivity(timestamp, reason, client_id, account_id)` is appended to the log for:
+blocking after wrong PINs, a login while blocked, a login with an unknown ID, a night attempt
+(the operation is also rejected) and a deposit or withdrawal of 1 000 000 or more
+(the operation still runs). `get_suspicious_activities(client_id=None)` returns the log,
+optionally for one client. The time comes from the bank's `clock`.
+
+## Search and reports
+
+- `search_accounts(**filters)` goes through all accounts in opening order and keeps those
+  that match every given filter: client, owner name (case-insensitive substring), status,
+  currency, account type (subclasses match), balance range.
+- `get_total_balance(currency)` sums open accounts of one currency. For an investment
+  account it uses `total_value` (cash + invested), since invested money still belongs to the client.
+- `get_clients_ranking(currency)` sums the same values per client and sorts by total,
+  descending; equal totals are ordered by name. Only clients with open accounts in that
+  currency are ranked.
+
 ## Account number
 
 - If no number is given, `BankAccount` calls its `id_generator`, which by default is
@@ -151,7 +239,8 @@ ACTIVE ─────────────► FROZEN
 
 - **Single responsibility.** Validation, ID generation and formatting live in `utils.py`;
   exceptions in `exceptions.py`; the account classes only hold state and apply rules.
-  Day 2 account types live in their own module, `accounts.py`.
+  Day 2 account types live in their own module, `accounts.py`; clients live in `clients.py`,
+  and `bank.py` only coordinates clients and accounts and applies the security rules.
 - **Open/closed.** The Day 2 account types were added by subclassing `BankAccount`;
   the only change to existing code was extracting `_debit` from `withdraw` so the
   subclasses can reuse it. Status rules are data (`_ALLOWED_TRANSITIONS`,
@@ -170,4 +259,5 @@ ACTIVE ─────────────► FROZEN
   (`id_generator: Callable[[], str]`) instead of calling `uuid` directly, so tests and
   other callers can provide their own. `project_yearly_growth` gets the growth rates
   as an argument instead of looking them up, so the account does not depend on any
-  source of market data.
+  source of market data. `Bank` gets its `clock` the same way, so the night rule does not
+  depend on the real time.

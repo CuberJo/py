@@ -1,9 +1,12 @@
-"""Demo of all account types: creation, status checks and money operations."""
+"""Demo of all account types and the bank: accounts, clients, logins and security rules."""
 
+from datetime import date, datetime
 from typing import Any, Callable
 
 from accounts import InvestmentAccount, PremiumAccount, SavingsAccount
-from exceptions import AccountError
+from bank import Bank
+from clients import Client
+from exceptions import BankError
 from models import AccountStatus, BankAccount, Owner
 
 # Illustrative yearly rates for the training model, not real market data
@@ -15,7 +18,7 @@ def attempt(description: str, operation: Callable[[], Any]) -> None:
     try:
         result = operation()
         print(f"  [OK]   {description} -> {result}")
-    except AccountError as error:
+    except BankError as error:
         print(f"  [FAIL] {description} -> {type(error).__name__}: {error}")
 
 
@@ -138,10 +141,145 @@ def demo_polymorphism(accounts: list[BankAccount]) -> None:
         print(f"  {account.get_account_info()}")
 
 
+class DemoClock:
+    """A settable clock, so the demo shows day and night rules whenever it is run."""
+
+    def __init__(self, now: datetime):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def demo_bank() -> None:
+    clock = DemoClock(datetime(2026, 10, 21, 14, 0))
+    bank = Bank("Training Bank", clock=clock)
+
+    print("\n=== Bank: clients ===")
+    john = bank.add_client(
+        Client(
+            "John Smith",
+            date(1985, 3, 12),
+            "1234",
+            client_id="CL-001",
+            phone="+1 (555) 010-2030",
+            email="john@example.com",
+        )
+    )
+    mary = bank.add_client(
+        Client(
+            "Mary Williams", date(1992, 7, 30), "5678", client_id="CL-002", email="mary@example.com"
+        )
+    )
+    robert = bank.add_client(Client("Robert Miller", date(1978, 1, 5), "9012", client_id="CL-003"))
+    for client in bank.clients:
+        print(f"  {client} | {client.contacts}")
+    attempt("Add a 16-year-old", lambda: Client("Tim Young", date(2010, 5, 1), "1111"))
+    attempt(
+        "Add a client with phone '123'",
+        lambda: Client("Ann Lee", date(1990, 1, 1), "1111", phone="123"),
+    )
+    attempt(
+        "Add CL-001 again",
+        lambda: bank.add_client(Client("Copy", date(1990, 1, 1), "1111", client_id="CL-001")),
+    )
+
+    print("\n=== Bank: opening accounts ===")
+    open_account = bank.open_account
+    attempt(
+        "John: bank account",
+        lambda: open_account(john.client_id, account_id="JOHN-USD-1", balance=5_000),
+    )
+    attempt(
+        "John: savings account",
+        lambda: open_account(
+            john.client_id,
+            SavingsAccount,
+            account_id="JOHN-SAV-1",
+            balance=20_000,
+            min_balance=5_000,
+        ),
+    )
+    attempt(
+        "John: EUR account",
+        lambda: open_account(
+            john.client_id, account_id="JOHN-EUR-1", balance=3_000, currency="EUR"
+        ),
+    )
+    attempt(
+        "Mary: premium account",
+        lambda: open_account(
+            mary.client_id, PremiumAccount, account_id="MARY-PRM-1", balance=2_000_000
+        ),
+    )
+    attempt(
+        "Robert: investment account",
+        lambda: open_account(
+            robert.client_id, InvestmentAccount, account_id="ROB-INV-1", balance=60_000
+        ),
+    )
+    attempt("Unknown client", lambda: open_account("CL-999"))
+    attempt(
+        "Robert: invest 40 000 in etf", lambda: bank.get_account("ROB-INV-1").invest("etf", 40_000)
+    )
+    print(f"  John's accounts: {john.account_ids}")
+
+    print("\n=== Bank: logins ===")
+    login = bank.authenticate_client
+    attempt("John, right PIN", lambda: login(john.client_id, "1234"))
+    for number in range(1, 4):
+        attempt(f"Mary, wrong PIN #{number}", lambda: login(mary.client_id, "0000"))
+    attempt("Mary, right PIN after blocking", lambda: login(mary.client_id, "5678"))
+    attempt("Mary: withdraw while blocked", lambda: bank.withdraw("MARY-PRM-1", 100))
+    attempt("Unknown client ID", lambda: login("CL-404", "1234"))
+    attempt("Unblock Mary", lambda: bank.unblock_client(mary.client_id))
+    attempt("Mary, right PIN", lambda: login(mary.client_id, "5678"))
+
+    print("\n=== Bank: freezing ===")
+    attempt("Freeze JOHN-USD-1", lambda: bank.freeze_account("JOHN-USD-1"))
+    attempt("Deposit to the frozen account", lambda: bank.deposit("JOHN-USD-1", 100))
+    attempt("Freeze it again", lambda: bank.freeze_account("JOHN-USD-1"))
+    attempt("Unfreeze JOHN-USD-1", lambda: bank.unfreeze_account("JOHN-USD-1"))
+    attempt("Deposit 100", lambda: bank.deposit("JOHN-USD-1", 100))
+
+    print("\n=== Bank: large operations and night time ===")
+    attempt("Mary: withdraw 1 000 000 (flagged)", lambda: bank.withdraw("MARY-PRM-1", 1_000_000))
+    clock.now = datetime(2026, 10, 22, 2, 30)
+    print(f"  Clock set to {clock.now:%H:%M}")
+    attempt("John: withdraw 100 at night", lambda: bank.withdraw("JOHN-USD-1", 100))
+    attempt("John: open an account at night", lambda: bank.open_account(john.client_id))
+    attempt("John: freeze at night (protective)", lambda: bank.freeze_account("JOHN-EUR-1"))
+    clock.now = datetime(2026, 10, 22, 9, 0)
+    print(f"  Clock set to {clock.now:%H:%M}")
+    attempt("John: unfreeze JOHN-EUR-1", lambda: bank.unfreeze_account("JOHN-EUR-1"))
+
+    print("\n=== Bank: search ===")
+    for description, filters in (
+        ("John's accounts", {"client_id": john.client_id}),
+        ("EUR accounts", {"currency": "EUR"}),
+        ("Balance from 10 000 to 100 000", {"min_balance": 10_000, "max_balance": 100_000}),
+        ("Savings accounts", {"account_type": SavingsAccount}),
+    ):
+        found = [a.account_id for a in bank.search_accounts(**filters)]
+        print(f"  {description}: {found}")
+
+    print("\n=== Bank: reports ===")
+    for currency in ("USD", "EUR"):
+        print(f"  Total balance {currency}: {bank.get_total_balance(currency)}")
+    print("  Clients ranking (USD):")
+    for rank in bank.get_clients_ranking():
+        print(f"    {rank.position}. {rank.client.full_name}: {rank.total}")
+    print("  Suspicious activity:")
+    for activity in bank.get_suspicious_activities():
+        print(f"    {activity.timestamp:%Y-%m-%d %H:%M} | {activity.client_id} | {activity.reason}")
+    print(f"  {bank}")
+
+
 def main() -> None:
     demo_bank_account()
     accounts: list[BankAccount] = [*demo_savings(), *demo_premium(), *demo_investment()]
     demo_polymorphism(accounts)
+    demo_bank()
 
 
 if __name__ == "__main__":

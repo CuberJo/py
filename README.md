@@ -5,6 +5,7 @@ A training model of bank accounts for practising OOP.
 single-currency account with input validation, status checks and auto-generated IDs.
 `SavingsAccount`, `PremiumAccount` and `InvestmentAccount` extend `BankAccount`
 with their own withdrawal rules and extra features.
+`Bank` manages `Client`s and their accounts, with PIN logins and security rules.
 
 All data lives in memory: there is no database, no external API and no real market data.
 
@@ -33,6 +34,24 @@ so code that works with a `BankAccount` works with any of them.
 Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFundsError`
 (or `LimitExceededError` for a premium amount over the limit) and leaves the account unchanged.
 
+### Bank and clients (Day 3)
+
+- `Client`: full name, ID (generated if not given), status (`active`, `blocked`), birth date
+  (must be 18 or older), contacts (phone, email), the numbers of their accounts and a PIN
+  of 4–6 digits stored only as a salted hash
+- `Bank` methods: `add_client()`, `open_account()` (of any account type), `close_account()`,
+  `freeze_account()`, `unfreeze_account()`, `deposit()`, `withdraw()`, `authenticate_client()`,
+  `unblock_client()`, `search_accounts()` (by client, owner name, status, currency, type, balance)
+- Reports: `get_total_balance(currency)` and `get_clients_ranking(currency)`; invested money counts,
+  closed accounts do not, and currencies are never mixed because the model has no exchange rates
+- Security:
+  - 3 wrong PINs in a row block the client; a blocked client cannot log in or operate until
+    `unblock_client()`; a successful login resets the counter
+  - no account operations from 00:00 to 05:00 (`OperationTimeError`); freezing is the exception,
+    since it protects the client, and logging in is allowed
+  - suspicious activity log (`get_suspicious_activities()`): blocking after failed logins, logins
+    while blocked or with an unknown ID, night attempts, deposits and withdrawals of 1 000 000 or more
+
 ## Project structure
 
 ```
@@ -42,11 +61,14 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── main.py        # demo
 │   ├── models.py      # AccountStatus, Currency, Owner, AbstractAccount, BankAccount
 │   ├── accounts.py    # SavingsAccount, PremiumAccount, InvestmentAccount, AssetType
+│   ├── clients.py     # Client, ClientStatus
+│   ├── bank.py        # Bank, SuspiciousActivity, ClientRank
 │   ├── utils.py       # money and rate validation, ID generation, formatting
 │   └── exceptions.py  # custom exceptions
 ├── tests/
 │   ├── test_main.py       # BankAccount, utils
-│   └── test_accounts.py   # savings, premium and investment accounts
+│   ├── test_accounts.py   # savings, premium and investment accounts
+│   └── test_bank.py       # clients, bank operations, logins, security rules, reports
 └── docs/
     └── algorithm.md   # algorithms and design
 ```
@@ -97,9 +119,32 @@ projection.total_growth            # Decimal('14700.00')
 projection.projected_value         # Decimal('194700.00')
 ```
 
+### Bank
+
+```python
+from datetime import date
+from bank import Bank
+from clients import Client
+from accounts import SavingsAccount
+
+bank = Bank("Training Bank")
+john = bank.add_client(Client("John Smith", date(1985, 3, 12), "1234", phone="+1 555 010 2030"))
+account = bank.open_account(john.client_id, SavingsAccount, balance=20_000, min_balance=5_000)
+bank.authenticate_client(john.client_id, "1234")   # returns the client
+bank.authenticate_client(john.client_id, "0000")   # AuthenticationError, attempts left: 2
+bank.freeze_account(account.account_id)
+bank.search_accounts(client_id=john.client_id, status="frozen")   # [account]
+bank.get_clients_ranking("USD")    # [ClientRank(position=1, client=..., total=Decimal('20000.00'))]
+```
+
+`Bank` takes an optional `clock` (a function returning `datetime`), so the night rule
+can be tested at any real time.
+
 The demo (`python src/main.py`) creates two accounts of each type, runs valid and invalid
 operations on them, and then calls `withdraw()`, `__str__()` and `get_account_info()`
 on all of them through one loop. The growth rates in the demo (stocks 10%, bonds 4%,
-etf 7%) are made-up values for the exercise.
+etf 7%) are made-up values for the exercise. The bank part of the demo adds clients,
+opens accounts, shows successful and failed logins with blocking, freezing, a night-time
+attempt on a settable clock, search, reports and the suspicious activity log.
 
 See [docs/algorithm.md](docs/algorithm.md) for how validation, statuses and the class design work.
