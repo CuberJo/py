@@ -1,5 +1,5 @@
 """Demo of all account types, the bank, transactions, the audit and risk analysis,
-and a simulation of a whole banking day."""
+a simulation of a whole banking day, and reports with charts built from it."""
 
 import tempfile
 from collections import Counter
@@ -13,6 +13,7 @@ from bank import Bank
 from clients import Client
 from exceptions import BankError
 from models import AccountStatus, BankAccount, Owner
+from report_builder import ReportBuilder
 from reports import AuditReport, TransactionReport
 from risk import RiskAnalyzer
 from transactions import (
@@ -22,6 +23,7 @@ from transactions import (
     TransactionQueue,
     TransactionStatus,
 )
+from utils import format_money
 
 # Illustrative yearly rates for the training model, not real market data
 DEMO_GROWTH_RATES = {"stocks": 0.10, "bonds": 0.04, "etf": 0.07}
@@ -576,7 +578,8 @@ def demo_audit(log_path: Path) -> None:
     print(f"\n  Audit log file: {len(saved)} entries read back from {log_path.name}")
 
 
-def demo_simulation() -> None:
+def demo_simulation() -> ReportBuilder:
+    """Simulate the day and return a report builder over its results."""
     clock = DemoClock(SIMULATION_RUN)
     audit_log = AuditLog(clock=clock)
     bank = Bank("Training Bank", clock=clock, audit_log=audit_log)
@@ -673,6 +676,33 @@ def demo_simulation() -> None:
     print("\n=== Simulation: reports ===")
     for line in report.render().splitlines():
         print(f"  {line}")
+    return ReportBuilder(bank, transactions, rates, audit_log=audit_log, risk_analyzer=analyzer)
+
+
+def demo_reports(builder: ReportBuilder, folder: Path) -> None:
+    reports = {
+        "client_CL-001": builder.client_report("CL-001"),
+        "bank": builder.bank_report(),
+        "risk": builder.risk_report(),
+    }
+    for report in reports.values():
+        print(f"\n=== Reports: {report.title} ===")
+        for line in report.text.splitlines():
+            print(f"  {line}")
+
+    print(f"\n=== Reports: export to {folder} ===")
+    for name, report in reports.items():
+        text = builder.export_to_text(report, folder / f"{name}.txt")
+        data = builder.export_to_json(report, folder / f"{name}.json")
+        table = builder.export_to_csv(report, folder / f"{name}.csv")
+        print(f"  {text.name}, {data.name}, {table.name} ({len(report.rows)} rows)")
+    history = builder.balance_history("CL-001")
+    print(
+        f"  John Smith's cash balance: {format_money(history[0].balance)} -> "
+        f"{format_money(history[-1].balance)} USD over {len(history) - 1} transactions"
+    )
+    for path in builder.save_charts(folder / "charts", client_id="CL-001"):
+        print(f"  charts/{path.name}")
 
 
 def main() -> None:
@@ -684,7 +714,9 @@ def main() -> None:
     # The demo log goes to a temporary folder, so running the demo leaves no files behind
     with tempfile.TemporaryDirectory() as folder:
         demo_audit(Path(folder) / "audit.jsonl")
-    demo_simulation()
+    builder = demo_simulation()
+    # Reports and charts are kept in output/ so they can be opened after the demo
+    demo_reports(builder, Path(__file__).resolve().parent.parent / "output")
 
 
 if __name__ == "__main__":

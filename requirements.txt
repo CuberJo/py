@@ -1,2 +1,4 @@
-# Runtime code uses only the standard library; pytest is needed for tests
+# The reports module draws charts with matplotlib; everything else uses only the standard library.
+# pytest is needed for tests
+matplotlib>=3.7
 pytest>=8.0

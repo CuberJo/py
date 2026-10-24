@@ -11,7 +11,8 @@ through a priority queue, with fees, currency conversion and retries.
 `AuditLog`, `RiskAnalyzer` and `AuditReport` record every event, score transactions for
 signs of fraud, block dangerous ones and report on them.
 `TransactionReport` adds bank-wide reports, and the demo ends with a simulation of a whole
-banking day.
+banking day. `ReportBuilder` turns the results into client, bank and risk reports
+(text, JSON, CSV) and draws charts with matplotlib.
 
 All data lives in memory: there is no database, no external API and no real market data.
 Exchange rates are fixed values passed in by the caller.
@@ -132,6 +133,34 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
   success rate, volume, fees) and the total balance per currency and in USD.
   The report converts currencies with `ExchangeRates`; `Bank` itself still never mixes them
 
+### Reports and charts (Day 7)
+
+`ReportBuilder(bank, transactions, rates, audit_log=..., risk_analyzer=...)` in `report_builder.py`:
+
+- **Report types**, each a `Report` with key figures (`summary`), a table (`rows`) and a text
+  version (`text`); money is converted to `rates.base`:
+
+  | Method | Summary | Rows (CSV) |
+  |---|---|---|
+  | `client_report(client_id)` | accounts and their value, total, transactions by status, risk profile | the client's transactions |
+  | `bank_report(top=3)` | clients, accounts, total balance, balance by currency, top clients, transaction statistics | every client with their total, richest first |
+  | `risk_report()` | thresholds, operations by risk level, factors, suspicious operations, client profiles, error statistics | every risk assessment, riskiest first |
+
+  The risk report needs the audit log and the risk analyzer; the other two work without them
+- **Export**: `export_to_json()` (Decimal as exact strings, dates in ISO format, enums as their
+  values), `export_to_csv()` (UTF-8 with BOM so spreadsheet programs open it) and `export_to_text()`
+- **Charts** (`charts()` returns matplotlib figures, `save_charts(folder, client_id=None)` saves them
+  as PNG):
+  - pie: money by currency, transactions by status, transactions by risk level, a client's accounts
+  - bar: richest clients, transactions by type, risk factors, failed attempts by error
+  - balance movement: the cash balance of the bank or of one client after each completed
+    transaction, as a step line. The opening balance is worked out backwards from today's
+    balances; invested money is not cash and is left out
+  - `pie_chart()`, `bar_chart()` and `balance_chart()` also work on their own with any
+    `{label: value}` data. Past 8 categories the rest is folded into "Other"; risk levels and
+    statuses use fixed status colours (green, yellow, red, gray)
+- The demo saves the reports of the Day 6 simulation and all ten charts to `output/`
+
 ## Project structure
 
 ```
@@ -147,6 +176,7 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── audit.py       # AuditLog, AuditEntry, AuditLevel
 │   ├── risk.py        # RiskAnalyzer, RiskAssessment, RiskLevel, RiskFactor, ClientRiskProfile
 │   ├── reports.py     # AuditReport, ErrorStatistics, TransactionReport, TransactionStatistics
+│   ├── report_builder.py  # ReportBuilder, Report, BalancePoint, pie/bar/balance charts
 │   ├── utils.py       # money and rate validation, ID generation, formatting
 │   └── exceptions.py  # custom exceptions
 ├── tests/
@@ -156,7 +186,8 @@ Rates are fractions: `0.01` is 1%. A failed withdrawal raises `InsufficientFunds
 │   ├── test_transactions.py  # transactions, queue, processor rules, ten transactions end to end
 │   ├── test_audit.py      # audit log: levels, file, filters, bank integration
 │   ├── test_risk.py       # risk factors, blocking, reports, ordinary and suspicious transactions
-│   └── test_reports.py    # queue logging, transaction report, the Day 6 simulation
+│   ├── test_reports.py    # queue logging, transaction report, the Day 6 simulation
+│   └── test_report_builder.py  # report types, balance history, export, charts, the Day 7 demo
 └── docs/
     └── algorithm.md   # algorithms and design
 ```
@@ -167,7 +198,7 @@ Requires Python 3.9+.
 
 ```bash
 pip install -r requirements.txt
-python src/main.py         # run the demo
+python src/main.py         # run the demo; reports and charts go to output/
 python -m pytest           # run the tests
 ```
 
@@ -278,6 +309,20 @@ report.total_balance()                  # all open accounts, in USD
 print(report.render())
 ```
 
+### Report builder
+
+```python
+from report_builder import ReportBuilder
+
+builder = ReportBuilder(bank, transactions, rates, audit_log=audit_log, risk_analyzer=analyzer)
+report = builder.client_report(john.client_id)     # also bank_report(), risk_report()
+print(report.text)
+builder.export_to_json(report, "output/john.json")
+builder.export_to_csv(report, "output/john.csv")  # one row per transaction
+builder.balance_history(john.client_id)           # [BalancePoint(position=0, ..., balance=...), ...]
+builder.save_charts("output/charts", client_id=john.client_id)   # list of PNG paths
+```
+
 The demo (`python src/main.py`) creates two accounts of each type, runs valid and invalid
 operations on them, and then calls `withdraw()`, `__str__()` and `get_account_info()`
 on all of them through one loop. The growth rates in the demo (stocks 10%, bonds 4%,
@@ -294,6 +339,7 @@ The audit part runs twelve ordinary and suspicious transactions through the risk
 (a large withdrawal, a very large transfer, a night transfer to a new account, a burst of
 operations followed by a large external transfer), prints the warnings and blocked operations
 from the audit log and the three reports, and reads the log file back from a temporary folder.
-The last part is the Day 6 simulation described above.
+Then comes the Day 6 simulation described above, and the Day 7 reports built from its results:
+the three reports are printed and saved to `output/` with all the charts.
 
 See [docs/algorithm.md](docs/algorithm.md) for how validation, statuses and the class design work.

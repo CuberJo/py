@@ -439,6 +439,35 @@ currencies, so this report converts them to `rates.base` (USD):
   overdraft makes a total negative; `ExchangeRates.convert()` accepts only positive amounts,
   so the report converts the absolute value and puts the sign back.
 
+## Report builder
+
+`ReportBuilder` reuses `TransactionReport` and `AuditReport` for the numbers and adds the
+report types, the export and the charts on top.
+
+- **Report**: kind, title, the bank's current time, `summary` (nested key figures), `rows` (one
+  flat dict per table line) and `text`. The bank and risk texts reuse the `render()` of the
+  existing reports, so the console and the file show the same figures.
+- **JSON**: `_plain()` walks the summary and rows and turns `Decimal` into a string (exact, no
+  float rounding), `datetime` into ISO 8601 and enums, also as dict keys, into their values.
+- **CSV**: the columns are the keys of all rows in the order first seen; values go through the
+  same `_plain()`. A report without rows gives an empty file.
+- **Balance history** (`balance_history(client_id=None)`):
+  1. take the client's accounts (or every account of the bank);
+  2. take the completed transactions touching them, sorted by `processed_at` (the sort is
+     stable, so transactions processed at the same moment keep the given order);
+  3. each one changes the balance by `-debited_amount` if the sender is one of the accounts and
+     `+credited_amount` if the receiver is, each converted from that account's currency;
+     a transfer between two of the client's own accounts changes only by the conversion;
+  4. opening balance = today's cash balance − the sum of all changes, so accounts opened
+     with money need no extra record. Then the changes are added one by one.
+- **Charts** use `matplotlib.figure.Figure` directly instead of `pyplot`: no GUI backend and no
+  global state, so they work in tests and leave nothing open. matplotlib is imported only when
+  a chart is drawn. Colours: one fixed categorical order, so a series never changes colour; a
+  bar chart is a single series, so one colour; risk levels and statuses use status colours.
+  A pie leaves out zero and negative values (an overdraft cannot be a slice) and, like a bar
+  chart, folds categories past the eighth into "Other". Labels are compact (`12.5K`) and
+  axes use space-separated thousands like `format_money`.
+
 ## Authentication
 
 ```
@@ -489,7 +518,9 @@ optionally for one client. The time comes from the bank's `clock`.
   In `transactions.py`, `Transaction` holds data and its status, `TransactionQueue` only orders
   and stores, and `TransactionProcessor` applies the transaction rules.
   `AuditLog` only stores and filters entries, `RiskAnalyzer` only scores, and `AuditReport`
-  only summarises what the other two collected.
+  only summarises what the other two collected. `ReportBuilder` only formats, exports and
+  draws what `TransactionReport` and `AuditReport` compute; the chart functions take plain
+  `{label: value}` data and know nothing about the bank.
 - **Open/closed.** The Day 2 account types were added by subclassing `BankAccount`;
   the only change to existing code was extracting `_debit` from `withdraw` so the
   subclasses can reuse it. Status rules are data (`_ALLOWED_TRANSITIONS`,

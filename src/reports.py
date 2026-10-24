@@ -187,14 +187,14 @@ class TransactionReport:
             by_status[transaction.status] += 1
             by_type[transaction.transaction_type] += 1
             if transaction.status is TransactionStatus.COMPLETED:
-                volume += self._to_base(transaction.amount, transaction.currency)
-                fees += self._to_base(transaction.fee, transaction.currency)
+                volume += self.to_base(transaction.amount, transaction.currency)
+                fees += self.to_base(transaction.fee, transaction.currency)
         return TransactionStatistics(len(self._transactions), by_status, by_type, volume, fees)
 
     def total_balance(self) -> Decimal:
         """Money in all open accounts of the bank."""
         return sum(
-            (self._to_base(self._bank.get_total_balance(c), c) for c in Currency),
+            (self.to_base(self._bank.get_total_balance(c), c) for c in Currency),
             Decimal("0.00"),
         )
 
@@ -208,7 +208,7 @@ class TransactionReport:
             for rank in self._bank.get_clients_ranking(currency):
                 client_id = rank.client.client_id
                 clients[client_id] = rank.client
-                totals[client_id] = totals.get(client_id, Decimal("0.00")) + self._to_base(
+                totals[client_id] = totals.get(client_id, Decimal("0.00")) + self.to_base(
                     rank.total, currency
                 )
         ordered = sorted(totals.items(), key=lambda item: (-item[1], clients[item[0]].full_name))
@@ -244,7 +244,8 @@ class TransactionReport:
         lines.append(f"  all accounts in {base}: {format_money(self.total_balance())}")
         return "\n".join(lines)
 
-    def _to_base(self, amount: Decimal, currency: Currency) -> Decimal:
+    def to_base(self, amount: Decimal, currency: Currency) -> Decimal:
+        """Convert an amount to the base currency; negative amounts stay negative."""
         # ExchangeRates.convert() takes only positive amounts, but a premium
         # account in overdraft can make a client's total negative
         if not amount:
